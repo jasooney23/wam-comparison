@@ -1,0 +1,19 @@
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+
+# Virtual environments and local settings
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Jupyter and tooling caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
