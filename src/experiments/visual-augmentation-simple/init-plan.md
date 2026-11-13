@@ -42,7 +42,6 @@
                 - transpose CNN for image
             - All MLPs have one hidden layer of 32 units 
         - Train WAM end to end
-            
 
 ## Guidelines
 - Envs should be built under the Gymnasium structure
@@ -50,3 +49,22 @@
     - Specifically, build an MLP class which can serve as backbone for many WAM/policy/value/etc. networks for WAMs/agents
 - Use pytorch
     - Support monitoring with tensorboard
+
+
+### End state
+- WAM which is trained via reconstruction and dynamics loss
+    - Reconstruction: Enc to z > Dec to x, L2 dec x against actual
+        - Do this for vector and image separately; average vector and image separately
+    - Dynamics: Enc to zt > Predict zt+1 with at > Dec to xt+1, L2 dec xt+1 against actual
+        - Average
+    - Losses summed at equal weights for now
+- Agent trained with the simplest PPO possible
+- WAM and agent trained jointly but gradients do not flow between them
+- Vector state does NOT contain full information of the environment
+- Evaluation at periodic intervals
+    - Evaluate on some number of episodes
+    - env parameters draw from the non-training parameters so WAM and agents only see out of distribution episodes
+    - evaluate on same seed for env start and drawing parameters
+    - Evaluation metrics:
+        - To evaluate overall control: Average return
+        - To evaluate WAM: average reconstruction loss, average dynamics loss
