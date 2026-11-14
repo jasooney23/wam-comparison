@@ -12,17 +12,16 @@ hinge_damping = [0.0, 0.0001]
 max_steps = 500
 
 [training]
-mode = "joint"
 # Each arm trains for the same number of episodes.
 episodes = 1000
-pretrain_transitions = 20000
-pretrain_epochs = 10
+dataset = "outputs/visual-augmentation-simple/dataset.pt"
+pretrain_transitions = 10000
+pretrain_epochs = 100
 batch_size = 256
 world_lr = 0.0003
 policy_lr = 0.0003
 vector_weight = 1.0
 image_weight = 1.0
-world_updates = 1
 
 [ppo]
 rollout_steps = 2048

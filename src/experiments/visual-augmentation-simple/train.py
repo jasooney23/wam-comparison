@@ -34,13 +34,11 @@ from common.environments.history_stack_wrapper import (
 )
 from common.models import Agent
 
-EXPERIMENT_VERSION = 4
+EXPERIMENT_VERSION = 5
 
 
 def validate(config):
-    """Reject invalid modes, ranges, weights, and training sizes early."""
-    if config["training"]["mode"] not in {"frozen", "alternating", "joint"}:
-        raise ValueError("training.mode must be frozen, alternating, or joint")
+    """Reject invalid ranges, weights, and training sizes early."""
     if not config["run"]["modalities"] or any(
         value not in {"vector", "image", "combined"}
         for value in config["run"]["modalities"]
@@ -68,7 +66,6 @@ def validate(config):
             "batch_size",
             "world_lr",
             "policy_lr",
-            "world_updates",
         ],
         "ppo": ["rollout_steps", "minibatch_size", "epochs", "max_grad_norm", "clip"],
         "evaluation": ["interval", "episodes", "prediction_transitions"],
@@ -220,9 +217,16 @@ def checked_step(loss, optimizer, parameters, max_norm):
     optimizer.step()
 
 
-def pretrain(agent, data, optimizer, config, counter, writer, device):
-    """Train the full world model on the shared random-action dataset."""
+def pretrain(
+    agent, data, optimizer, config, counter, writer, device, directory, seed, modality
+):
+    """Train the full world model on the fixed synthesized dataset."""
     settings = config["training"]
+    print(
+        f"Pretraining world model: seed={seed} modality={modality}, "
+        f"{settings['pretrain_epochs']} epochs",
+        flush=True,
+    )
 
     # Train each epoch
     for epoch in range(settings["pretrain_epochs"]):
@@ -240,6 +244,25 @@ def pretrain(agent, data, optimizer, config, counter, writer, device):
             counter["world_updates"] += 1
             total += loss.item() * len(indices)
         writer.add_scalar("pretrain/loss", total / len(order), epoch + 1)
+        print(
+            f"World model seed={seed} {modality}: "
+            f"epoch {epoch + 1}/{settings['pretrain_epochs']}, "
+            f"loss={total / len(order):.6f}, updates={counter['world_updates']:,}",
+            flush=True,
+        )
+        if (epoch + 1) % 20 == 0 or epoch + 1 == settings["pretrain_epochs"]:
+            torch.save(
+                {
+                    "experiment_version": EXPERIMENT_VERSION,
+                    "world": agent.world.state_dict(),
+                    "modality": modality,
+                    "seed": seed,
+                    "epoch": epoch + 1,
+                    "world_updates": counter["world_updates"],
+                    "environment": config["environment"],
+                },
+                directory / f"world-epoch-{epoch + 1:03d}.pt",
+            )
 
 
 def rollout(agent, actor, critic, env, config, seed, episodes, device):
@@ -314,31 +337,9 @@ def rollout(agent, actor, critic, env, config, seed, episodes, device):
     return data, episodes, scores
 
 
-def update(
-    agent, data, policy_optimizer, world_optimizer, config, counter, device, ppo_loss
-):
-    """Update the WAM and PPO separately, with no gradients between them."""
-    training, ppo = config["training"], config["ppo"]
-    mode = training["mode"]
-
-    def update_world(batch):
-        loss, _ = prediction_loss(agent, batch, training)
-        checked_step(
-            loss,
-            world_optimizer,
-            agent.world.parameters(),
-            ppo["max_grad_norm"],
-        )
-        counter["world_updates"] += 1
-
-    # Update world model
-    if mode == "alternating":
-        for _ in range(training["world_updates"]):
-            for indices in torch.randperm(len(data["action"])).split(
-                training["batch_size"]
-            ):
-                batch = to_device(data, indices, device, agent.world)
-                update_world(batch)
+def update(agent, data, policy_optimizer, config, counter, device, ppo_loss):
+    """Update the policy and value heads using PPO."""
+    ppo = config["ppo"]
 
     # PPO minibatches
     parameters = [p for group in policy_optimizer.param_groups for p in group["params"]]
@@ -346,10 +347,6 @@ def update(
         for indices in torch.randperm(len(data["action"])).split(ppo["minibatch_size"]):
             batch = to_device(data, indices, device, agent.world)
 
-            # Separate optimizer steps; PPO re-encodes with detached features.
-            if mode == "joint":
-                for _ in range(training["world_updates"]):
-                    update_world(batch)
             losses = ppo_loss(batch)
             loss = sum(
                 value for key, value in losses.items() if key.startswith("loss_")
@@ -428,27 +425,38 @@ def evaluate(agent, actor, held_out, config, seed, device):
 def shared_data(config, seed, directory):
     """Collect or reload exactly shared data, rejecting incompatible caches."""
     path = directory / "data.pt"
+    dataset_path = Path(config["training"]["dataset"])
+    dataset_stat = dataset_path.stat()
     signature = {
         "experiment_version": EXPERIMENT_VERSION,
         "environment": config["environment"],
         "training_size": config["training"]["pretrain_transitions"],
         "evaluation": config["evaluation"],
         "seed": seed,
+        "dataset": str(dataset_path.resolve()),
+        "dataset_size": dataset_stat.st_size,
+        "dataset_modified": dataset_stat.st_mtime_ns,
     }
 
-    # Reuse cached data
+    # Load the fixed synthesized training dataset.
+    dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
+    if dataset["environment"] != config["environment"]:
+        raise ValueError(
+            "Dataset environment does not match the training configuration"
+        )
+    data, metadata = dataset["training"], dataset["collection"]
+    if len(data["action"]) != config["training"]["pretrain_transitions"]:
+        raise ValueError("Dataset size does not match training.pretrain_transitions")
+
+    # Cache only held-out data; the training dataset is shared by all seeds.
     if path.exists():
         payload = torch.load(path, weights_only=False, map_location="cpu")
         if payload["signature"] != signature:
             raise ValueError(
                 f"Data configuration changed; choose a new output directory: {path}"
             )
-        return payload
+        return {**payload, "training": data, "collection": metadata}
 
-    # Collect shared datasets
-    data, metadata = random_rollouts(
-        config["environment"], config["training"]["pretrain_transitions"], seed
-    )
     held_out = [
         random_rollouts(
             config["environment"],
@@ -460,12 +468,10 @@ def shared_data(config, seed, directory):
     ]
     payload = {
         "signature": signature,
-        "training": data,
         "held_out": held_out,
-        "collection": metadata,
     }
     torch.save(payload, path)
-    return payload
+    return {**payload, "training": data, "collection": metadata}
 
 
 def load_checkpoint(path):
@@ -613,7 +619,7 @@ def match_compute(runs):
     return result
 
 
-def plot_comparison(output, mode):
+def plot_comparison(output):
     """Save OOD comparison curves and interpolated metrics at common environment steps."""
     import matplotlib
 
@@ -622,11 +628,11 @@ def plot_comparison(output, mode):
 
     runs = {}
     for modality in ("vector", "image", "combined"):
-        for path in sorted(output.glob(f"seed-*/{mode}/{modality}/metrics.csv")):
+        for path in sorted(output.glob(f"seed-*/{modality}/metrics.csv")):
             with path.open(newline="") as handle:
                 runs.setdefault(modality, []).append(list(csv.DictReader(handle)))
     matched = match_compute(runs)
-    with (output / f"comparison-{mode}.csv").open("w", newline="") as handle:
+    with (output / "comparison.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
@@ -681,11 +687,20 @@ def plot_comparison(output, mode):
         axis.grid(alpha=0.3)
     axes[-1].set_xlabel("Environment steps (interpolated within shared range)")
     figure.tight_layout()
-    figure.savefig(output / f"comparison-{mode}.png")
+    figure.savefig(output / "comparison.png")
     plt.close(figure)
 
 
-def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
+def run_arm(
+    config,
+    seed,
+    modality,
+    payload,
+    directory,
+    resume=None,
+    gui=False,
+    world_checkpoint=None,
+):
     """Train one modality and seed, optionally continuing a saved checkpoint."""
     directory.mkdir(parents=True, exist_ok=True)
     if (directory / "metrics.csv").exists() and resume is None:
@@ -756,14 +771,37 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
                 torch.cuda.set_rng_state_all(state["cuda_rng"])
         else:
             start = perf_counter()
-            pretrain(agent, data, world_optimizer, config, counter, writer, device)
+            if world_checkpoint:
+                state = torch.load(
+                    world_checkpoint, map_location="cpu", weights_only=False
+                )
+                if (
+                    state.get("experiment_version") != EXPERIMENT_VERSION
+                    or state.get("modality") != modality
+                    or state.get("environment") != config["environment"]
+                ):
+                    raise ValueError("World checkpoint is incompatible with this run")
+                agent.world.load_state_dict(state["world"])
+                counter["world_updates"] = state["world_updates"]
+            else:
+                pretrain(
+                    agent,
+                    data,
+                    world_optimizer,
+                    config,
+                    counter,
+                    writer,
+                    device,
+                    directory,
+                    seed,
+                    modality,
+                )
             if device.type == "cuda":
                 torch.cuda.synchronize()
             training_seconds += perf_counter() - start
 
         # Save run settings
-        if training["mode"] == "frozen":
-            agent.world.requires_grad_(False)
+        agent.world.requires_grad_(False)
         (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         (directory / "collection.json").write_text(
             json.dumps(payload["collection"], indent=2) + "\n"
@@ -816,7 +854,7 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
                 training_seconds,
             )
             print(
-                f"{training['mode']} seed={seed} {modality}: episode={episodes} "
+                f"seed={seed} {modality}: episode={episodes} "
                 f"OOD_return={metrics['return_ood']:.1f} steps={transitions:,}",
                 flush=True,
             )
@@ -834,7 +872,6 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
                 agent,
                 batch,
                 policy_optimizer,
-                world_optimizer,
                 config,
                 counter,
                 device,
@@ -867,7 +904,11 @@ def main():
     parser.add_argument(
         "--gui", action="store_true", help="Show the training CartPole environment"
     )
-    parser.add_argument("--mode", choices=["frozen", "alternating", "joint"])
+    parser.add_argument(
+        "--world-checkpoint",
+        type=Path,
+        help="Start a new agent from a world-model checkpoint",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--resume",
@@ -881,8 +922,6 @@ def main():
         config = tomllib.load(handle)
     if args.smoke:
         config = smoke_config(config)
-    if args.mode:
-        config["training"]["mode"] = args.mode
     if args.output:
         config["run"]["output"] = str(args.output)
     validate(config)
@@ -912,6 +951,10 @@ def main():
     if args.resume:
         state = load_checkpoint(args.resume)
         pairs = [(state["seed"], state["modality"])]
+    if args.world_checkpoint and (args.resume or len(pairs) != 1):
+        raise ValueError(
+            "--world-checkpoint requires one seed and modality and cannot be combined with --resume"
+        )
     payload_seed, payload = None, None
 
     # run training multiple times for each WAM config (different input modalities)
@@ -921,16 +964,25 @@ def main():
         if seed != payload_seed:
             payload = shared_data(config, seed, shared)
             payload_seed = seed
-        directory = shared / config["training"]["mode"] / modality
+        directory = shared / modality
         if args.resume and args.resume.resolve().parent != directory.resolve():
             raise ValueError(
                 "Resume checkpoint must belong to the configured output directory"
             )
 
         # Train!
-        run_arm(config, seed, modality, payload, directory, args.resume, args.gui)
+        run_arm(
+            config,
+            seed,
+            modality,
+            payload,
+            directory,
+            args.resume,
+            args.gui,
+            args.world_checkpoint,
+        )
 
-    plot_comparison(output, config["training"]["mode"])
+    plot_comparison(output)
 
 
 if __name__ == "__main__":

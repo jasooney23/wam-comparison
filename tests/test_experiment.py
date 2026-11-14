@@ -1,4 +1,4 @@
-"""Behavior checks for physics, training modes, measurement, and resume."""
+"""Behavior checks for physics, training, measurement, and resume."""
 
 import csv
 import importlib.util
@@ -39,6 +39,21 @@ def config(tmp_path):
     result["environment"]["max_steps"] = 5
     result["evaluation"]["settings"] = [[1.0, 0.0025]]
     return result
+
+
+def test_synthesized_dataset_is_reproducible(config):
+    spec = importlib.util.spec_from_file_location(
+        "dataset_generator", EXPERIMENT / "generate_dataset.py"
+    )
+    generator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(generator)
+    first, _ = generator.generate(config["environment"], 4, 17)
+    second, _ = generator.generate(config["environment"], 4, 17)
+    for key in first:
+        torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
+    assert first["image"].shape == (4, 4, 64, 64)
+    assert first["next_vector"].shape == (4, 3)
+    assert set(first["action"].tolist()) <= {0, 1}
 
 
 def test_zero_damping_matches_upstream():
@@ -186,11 +201,9 @@ def test_gae_bootstraps_truncations_without_reset_leakage():
     torch.testing.assert_close(data["value_target"], torch.tensor([[3.7], [1.0]]))
 
 
-@pytest.mark.parametrize("mode", ["frozen", "alternating", "joint"])
 @pytest.mark.parametrize("modality", ["vector", "image", "combined"])
-def test_training_mode_updates_only_intended_parameters(config, mode, modality):
+def test_agent_updates_only_policy_parameters(config, modality):
     torch.manual_seed(0)
-    config["training"]["mode"] = mode
     data, _ = random_rollouts(config["environment"], 8, 0)
     agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
@@ -198,32 +211,27 @@ def test_training_mode_updates_only_intended_parameters(config, mode, modality):
         data = critic(actor(TensorDict(data, batch_size=[8])))
     data["advantage"] = torch.ones(8, 1)
     data["value_target"] = torch.ones(8, 1)
-    if mode == "frozen":
-        agent.world.requires_grad_(False)
+    agent.world.requires_grad_(False)
     counter = {"world_updates": 0, "agent_updates": 0}
-    world_optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
     policy_parameters = list(agent.policy.parameters()) + list(agent.value.parameters())
     policy_optimizer = torch.optim.Adam(policy_parameters, lr=0.001)
     before_world = [p.clone() for p in agent.world.parameters()]
     before_policy = [p.clone() for p in agent.policy.parameters()]
-    training.update(
-        agent, data, policy_optimizer, world_optimizer, config, counter, "cpu", ppo_loss
-    )
+    training.update(agent, data, policy_optimizer, config, counter, "cpu", ppo_loss)
     world_changed = any(
         not torch.equal(old, new)
         for old, new in zip(before_world, agent.world.parameters())
     )
-    assert world_changed == (mode != "frozen")
+    assert not world_changed
     assert any(
         not torch.equal(old, new)
         for old, new in zip(before_policy, agent.policy.parameters())
     )
     assert counter["agent_updates"] > 0
-    assert (counter["world_updates"] > 0) == (mode != "frozen")
+    assert counter["world_updates"] == 0
 
 
 def test_resume_matches_uninterrupted_training(config, tmp_path):
-    config["training"]["mode"] = "joint"
     data, metadata = random_rollouts(config["environment"], 16, 0)
     held_out, _ = random_rollouts(
         config["environment"], 8, 20, fixed_params=(1.0, 0.0025)
@@ -306,16 +314,25 @@ def test_single_transition_rollout_bootstraps_time_limit(config):
     assert torch.isfinite(data["advantage"]).all()
 
 
-def test_bad_config_fails_before_collection(config):
-    config["training"]["mode"] = "unknown"
-    with pytest.raises(ValueError, match="training.mode"):
-        training.validate(config)
+def write_dataset(config, tmp_path):
+    data, metadata = random_rollouts(config["environment"], 32, 0)
+    path = tmp_path / "dataset.pt"
+    torch.save(
+        {
+            "environment": config["environment"],
+            "training": data,
+            "collection": metadata,
+        },
+        path,
+    )
+    config["training"]["dataset"] = str(path)
 
 
 def test_cached_data_rejects_changed_physics(config, tmp_path):
+    write_dataset(config, tmp_path)
     training.shared_data(config, 0, tmp_path)
     config["environment"]["cart_mass"] = [0.6, 1.4]
-    with pytest.raises(ValueError, match="Data configuration changed"):
+    with pytest.raises(ValueError, match="Dataset environment"):
         training.shared_data(config, 0, tmp_path)
 
 
@@ -425,21 +442,22 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     # Exercise the nonempty CSV and plot path as well as the interpolation.
     for modality, seeds in runs.items():
         for seed, data in enumerate(seeds):
-            directory = tmp_path / f"seed-{seed}" / "joint" / modality
+            directory = tmp_path / f"seed-{seed}" / modality
             directory.mkdir(parents=True)
             with (directory / "metrics.csv").open("w", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=list(data[0]))
                 writer.writeheader()
                 writer.writerows(data)
-    training.plot_comparison(tmp_path, "joint")
-    with (tmp_path / "comparison-joint.csv").open(newline="") as handle:
+    training.plot_comparison(tmp_path)
+    with (tmp_path / "comparison.csv").open(newline="") as handle:
         exported = list(csv.DictReader(handle))
     assert len(exported) == len(matched)
     assert all(row["method"] == "linear_interpolation" for row in exported)
-    assert (tmp_path / "comparison-joint.png").is_file()
+    assert (tmp_path / "comparison.png").is_file()
 
 
 def test_old_experiment_artifacts_are_rejected(config, tmp_path):
+    write_dataset(config, tmp_path)
     payload = training.shared_data(config, 0, tmp_path)
     payload["signature"].pop("experiment_version")
     torch.save(payload, tmp_path / "data.pt")

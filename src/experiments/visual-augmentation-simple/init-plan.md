@@ -56,12 +56,16 @@
 
 - Training
     - Pre-train the WM on a fixed dataset
-        - 
+        - Checkpoint at periodic intervals for number of training updates/passes of dataset (e.g. one checkpoint every 20 epochs)
     - Then train the agent
         - The WM is frozen during agent training
     - Separate the training phases: training script can be set to traing WM > Agent, or use existing WM and train a new agent only
 
 - WM Pre-training dataset
+    - Generate by artificially constructing possible states for the env
+        - e.g. one training pair is state = [cart_pos, cart_vel, pole_angle] = [-1, -0.5, 0.3, ...], and the image uniformly sampled action, and the env's next state + image
+        - This is NOT representative of the distribution the WM will actually experience as a result of the agent nor does it really guarantee valid states
+            - BUT it's OK for a simple env and toy experiment
 
 ## Guidelines
 - Envs should be built under the Gymnasium structure

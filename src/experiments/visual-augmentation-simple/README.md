@@ -14,40 +14,33 @@ Run from the repository root:
 
 ```powershell
 uv sync
-uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name())"
-uv run pytest -q
-uv run python src/experiments/visual-augmentation-simple/train.py --smoke --mode frozen --output outputs/smoke-frozen
-uv run python src/experiments/visual-augmentation-simple/train.py --smoke --mode alternating --output outputs/smoke-alternating
-uv run python src/experiments/visual-augmentation-simple/train.py --smoke --mode joint --output outputs/smoke-joint
+uv run python src/experiments/visual-augmentation-simple/generate_dataset.py
+uv run python src/experiments/visual-augmentation-simple/train.py
 ```
 
-Windows uses PyTorch's explicit CUDA 13.2 wheel index. Other platforms retain
-their default package sources. The config requests CUDA and fails early if it
-cannot execute GPU kernels. Set `run.device = "cpu"` explicitly for CPU runs.
-The project uses Python 3.14 because TorchRL 0.15 publishes wheels through that
-version. `uv sync` installs the pinned interpreter when needed.
-Smoke runs use real training, two episodes, and small datasets; they do not
-establish model quality or guarantee a shared compute range for comparison.
+The default dataset contains 100,000 samples. Each starts with a uniformly
+sampled cart position and pole angle within the termination limits, and cart
+velocity and pole angular velocity in `[-2, 2]`. The generator samples physics
+parameters from the configured training ranges and simulates three random
+steps to produce a four-frame history, rejecting histories that terminate early.
+It samples a uniform random action and saves the resulting next frame. This
+synthetic distribution need not match the agent's experience. Generation is
+seeded and the image tensors require approximately 2 GB of storage.
 
-Edit `config.toml` or pass `--config path/to/config.toml`. Launch a full run by
-omitting `--smoke`. Use a new `--output` directory for a new dataset/config.
-An existing run is never silently overwritten. Full runs have not been launched
-as part of implementation.
-Add `--gui` to show the CartPole environment while the agent trains.
-
-Resume one arm with the same command/config, adding its checkpoint:
+The world model trains for 100 passes over the fixed dataset. Checkpoints are
+saved every 20 epochs and at the final epoch. The agent then trains with that
+world model frozen. For a new agent using a saved world model, configure one
+seed and one modality and run:
 
 ```powershell
-uv run python src/experiments/visual-augmentation-simple/train.py --smoke --mode frozen --output outputs/smoke-frozen --resume outputs/smoke-frozen/seed-0/frozen/vector/episode-000001.pt
+uv run python src/experiments/visual-augmentation-simple/train.py --output outputs/new-agent --world-checkpoint outputs/visual-augmentation-simple/seed-0/vector/world-epoch-100.pt
 ```
 
-Resume restores model/optimizer state, normalization, random generators,
-episodes, environment steps, optimizer updates, and training timing. Only the episode
-limit may change. Checkpoints are at episode boundaries, so the next reset uses
-the same deterministic episode seed. Load only trusted local checkpoints.
-Datasets and checkpoints carry an experiment version. Artifacts from the old
-prediction-only objective or PPO backend are rejected. Start a new output
-directory for this experiment definition.
+Set `run.device = "cpu"` for CPU runs. Configure a different dataset path before
+generating a smoke dataset; pass `--smoke` to both scripts. Smoke runs use 32
+samples, one pretraining epoch and two agent episodes. Add `--gui` to display
+the environment during agent training. Use `--resume` with an episode checkpoint
+to resume an arm; only its episode limit may change. Load trusted checkpoints only.
 
 ## Observations and models
 
@@ -80,21 +73,10 @@ Vector-only models have no image decoder or loss. Image-only models have no
 vector decoder or loss and require no vector labels. Combined models train
 both branches end to end. The default comparison uses vector and combined.
 
-All training modes share random-action pretraining data and warm-start training:
-
-| Mode | Updates during control training |
-| --- | --- |
-| `frozen` | PPO updates policy and value heads; the world model stays fixed. |
-| `alternating` | Update the world model from the latest rollout, then PPO heads with its encoder fixed. |
-| `joint` | Update the WAM alongside PPO in each minibatch, using separate losses and optimizers. |
-
-The policy consumes the current encoded latent. Every mode detaches WAM features
-from PPO gradients. WAM loss updates only the WAM; PPO loss updates only the policy
-and value heads. The WAM optimizer continues from pretraining during joint and
-alternating updates. `world_updates` sets WAM steps per PPO minibatch in joint
-mode and full passes over a rollout in alternating mode. PPO bootstraps time
-limits, but stops GAE at every reset. Rollouts finish at episode and evaluation
-boundaries; they can be shorter or longer than the configured step target.
+The policy consumes the encoded latent. The world model is frozen throughout
+agent training; PPO updates the policy and value heads. PPO bootstraps time
+limits but stops GAE at resets. Rollouts finish at episode and evaluation
+boundaries and can differ from the configured step target.
 
 TorchRL owns categorical action sampling, clipped policy loss, squared-error
 value loss, optional entropy loss, and GAE normalization over each rollout.
@@ -143,7 +125,7 @@ not a controlled test of input information alone. Episode-return saturation at
 
 Each run records cumulative training wall time, environment steps, world-model
 optimizer updates, and agent optimizer updates. Environment steps include shared
-random-action training data and policy rollouts; world-model updates include
+synthesized training data and policy rollouts; world-model updates include
 pretraining. Training time includes the original shared training-data collection
 and training, and excludes evaluation and held-out data collection. CUDA work is
 synchronized at training boundaries. Collection time is charged to each arm.
@@ -154,14 +136,15 @@ per step or update across modalities.
 
 Under `run.output`:
 
-- `seed-N/data.pt`: shared training and held-out data, settings, and collection costs.
-- `seed-N/MODE/MODALITY/config.json`, `collection.json`: resolved settings and collection metadata.
+- `seed-N/data.pt`: held-out data and dataset settings.
+- `seed-N/MODALITY/config.json`, `collection.json`: resolved settings and collection metadata.
 - `metrics.csv`: episode counts, scores, errors, compute, transitions, updates, and timing.
+- `world-epoch-NNN.pt`: pretrained world-model checkpoints.
 - `episode-NNNNNN.pt`: resumable model and optimizer checkpoints, including update counts.
 - `curves.png`: all-setting scores, OOD WAM losses, and training counts against episodes.
 - `tensorboard/`: scalar event logs, including pretraining losses.
-- `comparison-MODE.png`: mean OOD return and WAM losses at common environment steps, with seed means ± one standard deviation.
-- `comparison-MODE.csv`: the matched values, environment steps, seed counts, and interpolation method.
+- `comparison.png`: mean OOD return and WAM losses at common environment steps, with seed means ± one standard deviation.
+- `comparison.csv`: the matched values, environment steps, seed counts, and interpolation method.
 
 ```powershell
 uv run tensorboard --logdir outputs/visual-augmentation-simple
