@@ -19,30 +19,21 @@ class HistoryStackWrapper(gym.Wrapper):
         settings: Environment config with sampling ranges and episode limit.
         images: Whether to render image observations.
         fixed_params: Optional fixed_params cart mass and damping for evaluation.
-        counter: Optional training operation counter.
         gui: Whether to show the environment in a window.
     """
 
-    def __init__(
-        self, settings, images=True, fixed_params=None, counter=None, gui=False
-    ):
+    def __init__(self, settings, images=True, fixed_params=None, gui=False):
         base = CartPoleEnv(
             render_mode="human" if gui else "rgb_array" if images else None,
             pole_mass=settings["pole_mass"],
         )
         super().__init__(gym.wrappers.TimeLimit(base, settings["max_steps"]))
-        self.settings, self.images, self.fixed_params, self.counter = (
+        self.settings, self.images, self.fixed_params = (
             settings,
             images,
             fixed_params,
-            counter,
         )
         self.vectors, self.frames = deque(maxlen=4), deque(maxlen=4)
-        self.times = {
-            "render_seconds": 0.0,
-            "preprocess_seconds": 0.0,
-            "environment_seconds": 0.0,
-        }
         observation_spaces = {"vector": spaces.Box(-np.inf, np.inf, (4, 3), np.float32)}
         if images:
             observation_spaces["image"] = spaces.Box(0, 255, (4, 64, 64), np.uint8)
@@ -54,14 +45,11 @@ class HistoryStackWrapper(gym.Wrapper):
 
         # Get image as grayscale
         if self.images:
-            start = perf_counter()
             img_rgb = (
                 self.unwrapped._last_frame
                 if self.unwrapped.render_mode == "human"
                 else self.env.render()
             )
-            self.times["render_seconds"] += perf_counter() - start
-            start = perf_counter()
             img_gray = np.dot(
                 img_rgb.astype(np.float32), np.array([0.299, 0.587, 0.114], np.float32)
             )
@@ -69,12 +57,6 @@ class HistoryStackWrapper(gym.Wrapper):
                 torch.from_numpy(img_gray)[None, None], size=(64, 64), mode="area"
             )
             frame = frame[0, 0].round().clamp(0, 255).numpy().astype(np.uint8)
-            self.times["preprocess_seconds"] += perf_counter() - start
-            if self.counter:
-                # RGB weighted sum plus area-resize accumulation and scaling.
-                self.counter.add(
-                    8 * img_rgb.shape[0] * img_rgb.shape[1] + 64 * 64, extra=True
-                )
 
         # Construct stacked obs
         for _ in range(4 if initial else 1):
@@ -113,11 +95,7 @@ class HistoryStackWrapper(gym.Wrapper):
 
     def step(self, action):
         """Step the parameterized physics and append the resulting observation."""
-        start = perf_counter()
         state, reward, terminated, truncated, info = self.env.step(action)
-        self.times["environment_seconds"] += perf_counter() - start
-        if self.counter:
-            self.counter.add(40, extra=True)
         return self._observe(state), reward, terminated, truncated, info
 
 
@@ -144,14 +122,12 @@ def random_rollouts(settings, n_rollouts, seed, fixed_params=None):
     }
     start = perf_counter()
     observation, _ = env.reset(seed=seed)
-    frames = 1
 
     # Generate rollouts
     try:
         for i in range(n_rollouts):
             action = int(rng.integers(2))
             future, _, terminated, truncated, _ = env.step(action)
-            frames += 1
             for key in ("vector", "image"):
                 arrays[key][i] = observation[key]
                 arrays[f"next_{key}"][i] = future[key][-1]
@@ -159,13 +135,8 @@ def random_rollouts(settings, n_rollouts, seed, fixed_params=None):
             observation = future
             if (terminated or truncated) and i + 1 < n_rollouts:
                 observation, _ = env.reset()
-                frames += 1
     finally:
         env.close()
 
-    metadata = dict(
-        env.times,
-        collection_seconds=perf_counter() - start,
-        estimated_operations=40 * n_rollouts + frames * (8 * 600 * 400 + 64 * 64),
-    )
+    metadata = {"collection_seconds": perf_counter() - start}
     return {key: torch.from_numpy(value) for key, value in arrays.items()}, metadata

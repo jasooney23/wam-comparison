@@ -43,6 +43,26 @@
             - All MLPs have one hidden layer of 32 units 
         - Train WAM end to end
 
+- Measuring compute
+    - Measure compute in the following ways:
+        - Wall clock time
+        - Environment steps
+        - Training updates (WM and agent separately)
+
+- Evaluation
+    - Use the following as evaluation metrics:
+    - WM: L2 of each state variable separately. i.e one loss for cart position, one for cart velocity, and one for pole angle
+    - Agent: Episodic return
+
+- Training
+    - Pre-train the WM on a fixed dataset
+        - 
+    - Then train the agent
+        - The WM is frozen during agent training
+    - Separate the training phases: training script can be set to traing WM > Agent, or use existing WM and train a new agent only
+
+- WM Pre-training dataset
+
 ## Guidelines
 - Envs should be built under the Gymnasium structure
 - Build models modularly as they may be reused
@@ -59,12 +79,8 @@
         - Average
     - Losses summed at equal weights for now
 - Agent trained with the simplest PPO possible
-- WAM and agent trained jointly but gradients do not flow between them
 - Vector state does NOT contain full information of the environment
 - Evaluation at periodic intervals
     - Evaluate on some number of episodes
     - env parameters draw from the non-training parameters so WAM and agents only see out of distribution episodes
     - evaluate on same seed for env start and drawing parameters
-    - Evaluation metrics:
-        - To evaluate overall control: Average return
-        - To evaluate WAM: average reconstruction loss, average dynamics loss

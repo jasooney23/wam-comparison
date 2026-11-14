@@ -1,4 +1,4 @@
-"""Behavior checks for physics, training modes, accounting, and resume."""
+"""Behavior checks for physics, training modes, measurement, and resume."""
 
 import csv
 import importlib.util
@@ -13,7 +13,6 @@ from tensordict import TensorDict
 from torch import nn
 from torchrl.objectives.value import GAE
 
-from common.compute import ComputeCounter
 from common.environments.cartpole import CartPoleEnv
 from common.environments.history_stack_wrapper import (
     HistoryStackWrapper,
@@ -169,29 +168,6 @@ def test_model_shapes_and_gradients(modality):
     )
 
 
-def test_accounting_linear_backward_and_exclusion():
-    model = nn.Linear(3, 2)
-    counter = ComputeCounter(model)
-    model(torch.ones(4, 3)).sum().backward()
-    # Forward: 48 multiply-add operations + 8 biases. Weight/bias backward: same.
-    assert counter.neural == 112
-    before = counter.state_dict().copy()
-    with counter.excluded():
-        model(torch.ones(4, 3)).sum().backward()
-    assert counter.state_dict() == before
-    counter.optimizer(model.parameters())
-    assert counter.extra == 15 * 8
-    counter.close()
-
-
-def test_accounting_convolution_and_input_gradient():
-    model = nn.Conv2d(1, 2, 3, bias=False)
-    counter = ComputeCounter(model)
-    model(torch.ones(1, 1, 4, 4, requires_grad=True)).sum().backward()
-    assert counter.neural == 2 * (1 * 2 * 2 * 2) * 9 * 3
-    counter.close()
-
-
 def test_gae_bootstraps_truncations_without_reset_leakage():
     data = TensorDict(
         {
@@ -224,7 +200,7 @@ def test_training_mode_updates_only_intended_parameters(config, mode, modality):
     data["value_target"] = torch.ones(8, 1)
     if mode == "frozen":
         agent.world.requires_grad_(False)
-    counter = ComputeCounter(agent)
+    counter = {"world_updates": 0, "agent_updates": 0}
     world_optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
     policy_parameters = list(agent.policy.parameters()) + list(agent.value.parameters())
     policy_optimizer = torch.optim.Adam(policy_parameters, lr=0.001)
@@ -242,8 +218,8 @@ def test_training_mode_updates_only_intended_parameters(config, mode, modality):
         not torch.equal(old, new)
         for old, new in zip(before_policy, agent.policy.parameters())
     )
-    assert counter.neural > 0
-    counter.close()
+    assert counter["agent_updates"] > 0
+    assert (counter["world_updates"] > 0) == (mode != "frozen")
 
 
 def test_resume_matches_uninterrupted_training(config, tmp_path):
@@ -264,8 +240,7 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
         torch.testing.assert_close(
             complete["agent"][key], resumed["agent"][key], rtol=0, atol=0
         )
-    for key in ("neural", "extra", "phases"):
-        assert complete["counter"][key] == resumed["counter"][key]
+    assert complete["counter"] == resumed["counter"]
     assert complete["transitions"] == resumed["transitions"]
     assert (directory / "curves.png").is_file()
 
@@ -314,15 +289,13 @@ def test_single_transition_rollout_bootstraps_time_limit(config):
     config["training"]["episodes"] = 1
     agent = Agent("vector")
     actor, critic, _ = training.ppo_modules(agent, config["ppo"])
-    counter = ComputeCounter(agent)
-    env = HistoryStackWrapper(config["environment"], images=False, counter=counter)
+    env = HistoryStackWrapper(config["environment"], images=False)
     try:
         data, episodes, scores = training.rollout(
-            agent, actor, critic, env, config, 0, 0, "cpu", counter
+            agent, actor, critic, env, config, 0, 0, "cpu"
         )
     finally:
         env.close()
-        counter.close()
     assert episodes == 1 and scores == [1.0]
     assert data["next", "done"].item()
     assert not data["next", "terminated"].item()
@@ -337,16 +310,6 @@ def test_bad_config_fails_before_collection(config):
     config["training"]["mode"] = "unknown"
     with pytest.raises(ValueError, match="training.mode"):
         training.validate(config)
-
-
-def test_accounting_transpose_convolution():
-    model = nn.ConvTranspose2d(2, 3, 4, 2, 1, bias=False)
-    counter = ComputeCounter(model)
-    model(torch.ones(1, 2, 2, 2)).sum().backward()
-    # 8 input elements * 3 output channels * 16 kernel positions * 2,
-    # repeated for the weight gradient (input has no requested gradient).
-    assert counter.neural == 8 * 3 * 16 * 2 * 2
-    counter.close()
 
 
 def test_cached_data_rejects_changed_physics(config, tmp_path):
@@ -413,14 +376,9 @@ def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality
     held_out, _ = random_rollouts(
         config["environment"], 5, 20, fixed_params=config["evaluation"]["settings"][0]
     )
-    counter = ComputeCounter(agent)
     before = {key: value.clone() for key, value in agent.state_dict().items()}
-    before_counter = counter.state_dict()
-    metrics = training.evaluate(agent, actor, [held_out], config, 0, "cpu", counter)
-    assert metrics == training.evaluate(
-        agent, actor, [held_out], config, 0, "cpu", counter
-    )
-    assert counter.state_dict() == before_counter
+    metrics = training.evaluate(agent, actor, [held_out], config, 0, "cpu")
+    assert metrics == training.evaluate(agent, actor, [held_out], config, 0, "cpu")
     for key, value in agent.state_dict().items():
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
     assert metrics["return_ood"] == 5
@@ -428,15 +386,13 @@ def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality
     for key, value in expected.items():
         assert metrics[f"{key}_ood"] == pytest.approx(value.item())
     assert not any("familiar" in key for key in metrics)
-    counter.close()
 
 
 def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     def rows(costs, returns):
         return [
             {
-                "selected_operations": cost,
-                "compute_budget": 100,
+                "transitions": cost,
                 "return_ood": score,
                 "reconstruction_loss_ood": score / 10,
                 "dynamics_loss_ood": score / 5,
@@ -449,8 +405,8 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
         "combined": [rows([50, 80, 130], [10, 16, 26])],
     }
     matched = training.match_compute(runs)
-    assert min(row["selected_operations"] for row in matched) == 50
-    assert max(row["selected_operations"] for row in matched) == 100
+    assert min(row["transitions"] for row in matched) == 50
+    assert max(row["transitions"] for row in matched) == 110
     vector = next(
         row
         for row in matched
@@ -481,46 +437,6 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     assert len(exported) == len(matched)
     assert all(row["method"] == "linear_interpolation" for row in exported)
     assert (tmp_path / "comparison-joint.png").is_file()
-
-
-def test_budget_stops_training_without_episode_cap(config, tmp_path):
-    config["training"].update(episodes=0, compute_budget=2_000_000)
-    config["evaluation"]["interval"] = 100
-    data, metadata = random_rollouts(config["environment"], 8, 0)
-    held_out, _ = random_rollouts(
-        config["environment"], 4, 20, fixed_params=config["evaluation"]["settings"][0]
-    )
-    directory = tmp_path / "budget"
-    training.run_arm(
-        config,
-        0,
-        "vector",
-        {"training": data, "held_out": [held_out], "collection": metadata},
-        directory,
-    )
-    with (directory / "metrics.csv").open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    final = rows[-1]
-    assert int(final["episode"]) > 0
-    assert int(final["budget_reached"]) == 1
-    assert (
-        int(final["budget_overshoot"]) == int(final["selected_operations"]) - 2_000_000
-    )
-    assert len(rows) == 2  # Initial evaluation and the final budget boundary.
-    checkpoint = training.load_checkpoint(
-        directory / f"episode-{int(final['episode']):06d}.pt"
-    )
-    assert checkpoint["counter"]["neural"] == int(final["selected_operations"])
-
-    config["training"]["compute_budget"] = 1
-    with pytest.raises(ValueError, match="exhausted during pretraining"):
-        training.run_arm(
-            config,
-            0,
-            "vector",
-            {"training": data, "held_out": [held_out], "collection": metadata},
-            tmp_path / "too-small",
-        )
 
 
 def test_old_experiment_artifacts_are_rejected(config, tmp_path):

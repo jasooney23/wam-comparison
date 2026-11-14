@@ -1,10 +1,8 @@
 # Visual augmentation on CartPole
 
-Compare vector-only and vector-plus-image world models under a shared training
-compute budget. The default experiment has three paired seeds. Each arm trains
-until it reaches `training.compute_budget` (100 trillion nominal operations).
-`training.episodes = 0` removes the episode cap; a positive value adds a cap.
-Comparison plots and CSVs match cumulative compute over the range all arms cover.
+Compare vector-only and vector-plus-image world models over three paired seeds.
+Each arm trains for `training.episodes` episodes. Comparisons align runs by
+cumulative environment steps over the range all arms cover.
 
 PPO uses TorchRL's `ProbabilisticActor`, `ClipPPOLoss`, and `GAE`. Rollouts and
 minibatches use TensorDict. A small Gymnasium loop retains exact episode limits
@@ -44,7 +42,7 @@ uv run python src/experiments/visual-augmentation-simple/train.py --smoke --mode
 ```
 
 Resume restores model/optimizer state, normalization, random generators,
-episodes, transitions, updates, compute, and training timing. Only the episode
+episodes, environment steps, optimizer updates, and training timing. Only the episode
 limit may change. Checkpoints are at episode boundaries, so the next reset uses
 the same deterministic episode seed. Load only trusted local checkpoints.
 Datasets and checkpoints carry an experiment version. Artifacts from the old
@@ -141,52 +139,16 @@ guaranteed. The extra image reconstruction and prediction losses change the obje
 not a controlled test of input information alone. Episode-return saturation at
 500 can hide differences. Check prediction error and held-out settings too.
 
-## Compute conventions
+## Compute measures
 
-Counters describe nominal arithmetic, not measured hardware instructions or
-energy. They depend on executed batch shapes, not just parameter counts or
-episode count. CUDA kernel fusion, padding optimizations, and precision can
-change actual hardware work. Model and optimizer arithmetic estimates use these
-fixed conventions in every arm:
-
-| Operation | Count |
-| --- | --- |
-| Linear | Two operations per multiply-add, plus output bias additions. |
-| Convolution | Two operations per nominal kernel multiply-add, including padding. |
-| Transpose convolution | Input elements × output channels/group × kernel area × two, plus bias. |
-| Layer backward | Weight-gradient work and input-gradient work when needed; bias reduction. |
-| ReLU | One scalar operation forward and backward per element. |
-| Sigmoid | Four scalar operations forward, three backward per element. |
-| Vector normalization / MSE | Shape-based scalar-operation allowance in the training loop. |
-| Policy distribution / PPO loss / GAE | Fixed per-sample scalar allowances documented in code. |
-| Adam | Fifteen scalar operations per parameter with a gradient, in the broader scope. |
-| Physics | Forty scalar operations per transition, in the broader scope. |
-| Image preprocessing | `8 × source_height × source_width + 4096` operations per frame, in the broader scope. |
-
-Thus the neural total is a consistent arithmetic estimate, including approximated
-loss/distribution work; it is not an exhaustive profiler measurement. Tensor
-reshaping, indexing, concatenation, storage, random generation, comparisons,
-gradient-norm clipping, rendering, and general Python execution have no complete
-FLOP accounting here. Activation estimates include comparisons as scalar work.
-Do not interpret these counters as exact total-device FLOPs.
-
-Both scopes are selectable through `accounting.scope`:
-
-- `neural`: network arithmetic for pretraining, PPO, and training action/value inference.
-- `broader_estimate`: neural totals plus estimated preprocessing, physics, and Adam work.
-
-Both totals are always saved. Evaluation and held-out dataset creation are
-excluded. Shared training-data collection costs are logged separately and charged
-once to each arm's broader total, representing an independently run arm. Each
-arm's pretraining is included at episode zero. Reused datasets retain their
-original collection metadata. Additional vector normalization, loss, or image
-scaling allowances are recorded at their training call sites.
-
-Training elapsed time excludes evaluation and shared collection, which has its
-own metadata. Training totals synchronize CUDA at phase/update boundaries.
-Environment, rendering, preprocessing, and batch-transfer timings are recorded
-separately. Batch-transfer timing includes host enqueue work and is not a GPU
-kernel timer; timing categories are diagnostic and can overlap with training.
+Each run records cumulative training wall time, environment steps, world-model
+optimizer updates, and agent optimizer updates. Environment steps include shared
+random-action training data and policy rollouts; world-model updates include
+pretraining. Training time includes the original shared training-data collection
+and training, and excludes evaluation and held-out data collection. CUDA work is
+synchronized at training boundaries. Collection time is charged to each arm.
+These measures describe different aspects of compute and do not imply equal cost
+per step or update across modalities.
 
 ## Artifacts
 
@@ -195,29 +157,24 @@ Under `run.output`:
 - `seed-N/data.pt`: shared training and held-out data, settings, and collection costs.
 - `seed-N/MODE/MODALITY/config.json`, `collection.json`: resolved settings and collection metadata.
 - `metrics.csv`: episode counts, scores, errors, compute, transitions, updates, and timing.
-- `episode-NNNNNN.pt`: resumable model and optimizer checkpoints, including counters by phase.
-- `curves.png`: all-setting scores, OOD WAM losses, and both compute totals against episodes.
+- `episode-NNNNNN.pt`: resumable model and optimizer checkpoints, including update counts.
+- `curves.png`: all-setting scores, OOD WAM losses, and training counts against episodes.
 - `tensorboard/`: scalar event logs, including pretraining losses.
-- `comparison-MODE.png`: mean OOD return and WAM losses at common compute, with seed means ± one standard deviation.
-- `comparison-MODE.csv`: the matched values, operation counts, seed counts, and interpolation method.
+- `comparison-MODE.png`: mean OOD return and WAM losses at common environment steps, with seed means ± one standard deviation.
+- `comparison-MODE.csv`: the matched values, environment steps, seed counts, and interpolation method.
 
 ```powershell
 uv run tensorboard --logdir outputs/visual-augmentation-simple
 ```
 
-Each seed's evaluations are linearly interpolated onto common operation counts
+Each seed's evaluations are linearly interpolated onto common environment steps
 before calculating means and seed spread. The range starts at the largest
-pretraining cost and ends at the smallest final cost or budget across all runs.
+pretraining step count and ends at the smallest final step count across all runs.
 There is no extrapolation. These are interpolated estimates, not fresh evaluations
-of models trained to exactly identical operation counts. If smoke runs have no
+of models trained to exactly identical environment steps. If smoke runs have no
 shared range, the comparison CSV is empty and the plot explains why.
 
-Budget checks occur at episode and optimizer-minibatch boundaries. The final
-operation count can exceed the budget by one such unit. `metrics.csv` records
-`budget_reached` and `budget_overshoot`; comparisons stop at the budget. A positive
-episode cap can stop an arm earlier. A budget that cannot cover pretraining fails
-with an explicit error. Evaluation is recorded at the configured episode interval
-and at the final training boundary. No full-budget runs have been validated.
+Evaluation is recorded at the configured episode interval and at the final episode.
 
 Raw evaluations and within-setting episode standard deviations are also saved.
 Checkpoints, logs, plots, and datasets are ignored by version control.

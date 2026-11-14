@@ -13,9 +13,8 @@ max_steps = 500
 
 [training]
 mode = "joint"
-# Zero removes the episode cap; each arm trains to the same operation budget.
-episodes = 0
-compute_budget = 100_000_000_000_000
+# Each arm trains for the same number of episodes.
+episodes = 1000
 pretrain_transitions = 20000
 pretrain_epochs = 10
 batch_size = 256
@@ -42,6 +41,3 @@ episodes = 10
 prediction_transitions = 256
 # Every pair is outside the joint training parameter range.
 settings = [[1.0, 0.0025], [0.25, 0.0025], [2.0, 0.0025], [1.0, 0.01], [0.25, 0.01], [2.0, 0.01]]
-
-[accounting]
-scope = "neural" # neural or broader_estimate
