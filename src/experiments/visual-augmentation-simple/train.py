@@ -1,4 +1,4 @@
-"""Train paired CartPole agents and save episode-based comparison curves."""
+"""Train paired CartPole agents and compare held-out results at equal compute."""
 
 # General
 import argparse
@@ -29,8 +29,13 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "outputs" / ".matplotlib"))
 from common.compute import ComputeCounter
-from common.environments.history import History, collect
+from common.environments.history_stack_wrapper import (
+    HistoryStackWrapper,
+    random_rollouts,
+)
 from common.models import Agent
+
+EXPERIMENT_VERSION = 2
 
 
 def validate(config):
@@ -61,7 +66,7 @@ def validate(config):
         "run": ["cpu_threads"],
         "environment": ["pole_mass", "max_steps"],
         "training": [
-            "episodes",
+            "compute_budget",
             "pretrain_transitions",
             "pretrain_epochs",
             "batch_size",
@@ -84,15 +89,19 @@ def validate(config):
             ):
                 raise ValueError(f"{section}.{key} must be an integer")
 
-    # Loss weights
-    for key in ("vector_weight", "image_weight", "joint_weight"):
-        value = config["training"][key]
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"training.{key} must be finite and nonnegative")
-    if config["training"]["vector_weight"] <= 0:
+    if (
+        type(config["training"]["episodes"]) is not int
+        or config["training"]["episodes"] < 0
+    ):
         raise ValueError(
-            "A positive vector_weight is required for the shared prediction target"
+            "training.episodes must be a nonnegative integer (zero means no cap)"
         )
+
+    # Loss weights
+    for key in ("vector_weight", "image_weight"):
+        value = config["training"][key]
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"training.{key} must be finite and positive")
     for key in ("gamma", "gae_lambda"):
         if not 0 <= config["ppo"][key] <= 1:
             raise ValueError(f"ppo.{key} must be between zero and one")
@@ -122,6 +131,13 @@ def validate(config):
             raise ValueError(
                 "Evaluation settings require positive mass and nonnegative damping"
             )
+        if all(
+            config["environment"][key][0] <= value <= config["environment"][key][1]
+            for key, value in zip(("cart_mass", "hinge_damping"), pair)
+        ):
+            raise ValueError(
+                "Evaluation settings must be outside the training parameter ranges"
+            )
     if not config["evaluation"]["settings"]:
         raise ValueError("At least one evaluation setting is required")
 
@@ -139,11 +155,28 @@ def smoke_config(config):
     return config
 
 
-def to_device(data, indices, device, images, counter=None):
+def selected_operations(counter, config):
+    """Return the cumulative training operations in the configured scope."""
+    return counter.neural + (
+        counter.extra if config["accounting"]["scope"] == "broader_estimate" else 0
+    )
+
+
+def budget_exhausted(counter, config):
+    """Check the shared compute limit at an episode or minibatch boundary."""
+    return selected_operations(counter, config) >= config["training"]["compute_budget"]
+
+
+def to_device(data, indices, device, world, counter=None):
     """Select a CPU batch and transfer only required modalities to the device."""
     start = perf_counter()
     result = TensorDict(
-        {key: value for key, value in data.items() if images or "image" not in key},
+        {
+            key: value
+            for key, value in data.items()
+            if (world.has_image or "image" not in key)
+            and (world.has_vector or "vector" not in key)
+        },
         batch_size=[len(data["action"])],
     )[indices].to(device)
     if counter is not None and counter.enabled:
@@ -158,7 +191,14 @@ def observation_batch(observation, device):
 
 def ppo_modules(agent, settings):
     """Wrap shared networks in TorchRL's actor, critic, and PPO objective."""
-    inputs = ["vector", "image"] if agent.world.has_image else ["vector"]
+    inputs = {
+        name: name
+        for name, enabled in (
+            ("vector", agent.world.has_vector),
+            ("image", agent.world.has_image),
+        )
+        if enabled
+    }
     actor = ProbabilisticActor(
         TensorDictModule(agent, in_keys=inputs, out_keys=["latent", "logits"]),
         in_keys=["logits"],
@@ -182,17 +222,19 @@ def ppo_modules(agent, settings):
 
 
 def prediction_loss(agent, batch, training, counter):
-    """Compute prediction loss and count normalization and MSE arithmetic."""
-    loss, vector, image = agent.world.loss(
+    """Compute both WAM losses and count normalization and MSE arithmetic."""
+    loss, metrics = agent.world.loss(
         batch, training["vector_weight"], training["image_weight"]
     )
 
     # Count loss operations
-    n = batch["vector"].shape[0]
-    counter.add(n * (24 * int(agent.world.has_vector) + 12))
+    n = len(batch["action"])
+    # Three normalized histories and two MSEs, including approximate backward work.
+    if agent.world.has_vector:
+        counter.add(n * (6 * 12 + 10 * 12))
     if agent.world.has_image:
-        counter.add(n * (4 * 64 * 64 + 5 * 64 * 64))
-    return loss, vector, image
+        counter.add(n * (3 * 4 * 64 * 64 + 10 * 4 * 64 * 64))
+    return loss, metrics
 
 
 def checked_step(loss, optimizer, parameters, counter, max_norm):
@@ -217,8 +259,12 @@ def pretrain(agent, data, optimizer, config, counter, writer, device):
         order = torch.randperm(len(data["action"]))
         total = 0.0
         for indices in order.split(settings["batch_size"]):
-            batch = to_device(data, indices, device, agent.world.has_image, counter)
-            loss, _, _ = prediction_loss(agent, batch, settings, counter)
+            if budget_exhausted(counter, config):
+                raise ValueError(
+                    "Compute budget exhausted during pretraining; increase it or reduce pretraining"
+                )
+            batch = to_device(data, indices, device, agent.world, counter)
+            loss, _ = prediction_loss(agent, batch, settings, counter)
             checked_step(
                 loss,
                 optimizer,
@@ -228,12 +274,16 @@ def pretrain(agent, data, optimizer, config, counter, writer, device):
             )
             total += loss.item() * len(indices)
         writer.add_scalar("pretrain/loss", total / len(order), epoch + 1)
+    if budget_exhausted(counter, config):
+        raise ValueError(
+            "Compute budget exhausted during pretraining; increase it or reduce pretraining"
+        )
 
 
 def rollout(agent, actor, critic, env, config, seed, episodes, device, counter):
     """Collect policy data, finishing at an episode boundary for exact resume."""
     settings = config["ppo"]
-    target = config["training"]["episodes"]
+    target = config["training"]["episodes"] or math.inf
     next_evaluation = (episodes // config["evaluation"]["interval"] + 1) * config[
         "evaluation"
     ]["interval"]
@@ -293,8 +343,10 @@ def rollout(agent, actor, critic, env, config, seed, episodes, device, counter):
         if ended:
             episodes += 1
             scores.append(score)
-            if len(transitions) >= settings["rollout_steps"] or episodes >= min(
-                target, next_evaluation
+            if (
+                len(transitions) >= settings["rollout_steps"]
+                or episodes >= min(target, next_evaluation)
+                or budget_exhausted(counter, config)
             ):
                 break
             observation, _ = env.reset(seed=seed * 100_000 + episodes)
@@ -315,10 +367,20 @@ def rollout(agent, actor, critic, env, config, seed, episodes, device, counter):
 def update(
     agent, data, policy_optimizer, world_optimizer, config, counter, device, ppo_loss
 ):
-    """Apply alternating or joint representation updates and clipped PPO."""
+    """Update the WAM and PPO separately, with no gradients between them."""
     training, ppo = config["training"], config["ppo"]
     mode = training["mode"]
     counter.phase = "ppo"
+
+    def update_world(batch):
+        loss, _ = prediction_loss(agent, batch, training, counter)
+        checked_step(
+            loss,
+            world_optimizer,
+            agent.world.parameters(),
+            counter,
+            ppo["max_grad_norm"],
+        )
 
     # Update world model
     if mode == "alternating":
@@ -326,30 +388,29 @@ def update(
             for indices in torch.randperm(len(data["action"])).split(
                 training["batch_size"]
             ):
-                batch = to_device(data, indices, device, agent.world.has_image, counter)
-                loss, _, _ = prediction_loss(agent, batch, training, counter)
-                checked_step(
-                    loss,
-                    world_optimizer,
-                    agent.world.parameters(),
-                    counter,
-                    ppo["max_grad_norm"],
-                )
+                if budget_exhausted(counter, config):
+                    return
+                batch = to_device(data, indices, device, agent.world, counter)
+                update_world(batch)
 
     # PPO minibatches
     parameters = [p for group in policy_optimizer.param_groups for p in group["params"]]
     for _ in range(ppo["epochs"]):
         for indices in torch.randperm(len(data["action"])).split(ppo["minibatch_size"]):
-            batch = to_device(data, indices, device, agent.world.has_image, counter)
+            if budget_exhausted(counter, config):
+                return
+            batch = to_device(data, indices, device, agent.world, counter)
 
-            # PPO and prediction losses
+            # Separate optimizer steps; PPO re-encodes with detached features.
+            if mode == "joint":
+                for _ in range(training["world_updates"]):
+                    update_world(batch)
+                    if budget_exhausted(counter, config):
+                        return
             losses = ppo_loss(batch)
             loss = sum(
                 value for key, value in losses.items() if key.startswith("loss_")
             )
-            if mode == "joint":
-                model_loss, _, _ = prediction_loss(agent, batch, training, counter)
-                loss = loss + training["joint_weight"] * model_loss
             counter.add(
                 len(indices)
                 * (
@@ -364,7 +425,7 @@ def update(
 
 
 def evaluate(agent, actor, held_out, config, seed, device, counter):
-    """Measure deterministic returns and prediction errors without training FLOPs."""
+    """Measure paired OOD control, reconstruction, and dynamics without training."""
     metrics = {}
     with (
         counter.excluded(),
@@ -372,9 +433,11 @@ def evaluate(agent, actor, held_out, config, seed, device, counter):
         set_exploration_type(ExplorationType.MODE),
     ):
         for number, setting in enumerate(config["evaluation"]["settings"]):
-            label = "familiar" if number == 0 else f"heldout_{number}"
-            env = History(
-                config["environment"], images=agent.world.has_image, fixed=setting
+            label = f"heldout_{number}"
+            env = HistoryStackWrapper(
+                config["environment"],
+                images=agent.world.has_image,
+                fixed_params=setting,
             )
 
             # Evaluate control
@@ -398,19 +461,34 @@ def evaluate(agent, actor, held_out, config, seed, device, counter):
             metrics[f"return_std_{label}"] = float(np.std(scores))
 
             # Evaluate predictions
-            vector_total, image_total, count = 0.0, 0.0, 0
+            totals, count = {}, 0
             data = held_out[number]
             for indices in torch.arange(len(data["action"])).split(
                 config["training"]["batch_size"]
             ):
-                batch = to_device(data, indices, device, agent.world.has_image)
-                _, vector, image = agent.world.loss(batch)
-                vector_total += vector.item() * len(indices)
-                image_total += image.item() * len(indices)
+                batch = to_device(data, indices, device, agent.world)
+                _, losses = agent.world.loss(
+                    batch,
+                    config["training"]["vector_weight"],
+                    config["training"]["image_weight"],
+                )
+                for key, value in losses.items():
+                    totals[key] = totals.get(key, 0.0) + value.item() * len(indices)
                 count += len(indices)
-            metrics[f"vector_mse_{label}"] = vector_total / count
-            if agent.world.has_image:
-                metrics[f"image_mse_{label}"] = image_total / count
+            metrics.update(
+                {f"{key}_{label}": value / count for key, value in totals.items()}
+            )
+
+    # Equal episode and dataset sizes make this a uniform average over OOD settings.
+    for key in ("return", *totals):
+        metrics[f"{key}_ood"] = float(
+            np.mean(
+                [
+                    metrics[f"{key}_heldout_{number}"]
+                    for number in range(len(config["evaluation"]["settings"]))
+                ]
+            )
+        )
     return metrics
 
 
@@ -418,6 +496,7 @@ def shared_data(config, seed, directory):
     """Collect or reload exactly shared data, rejecting incompatible caches."""
     path = directory / "data.pt"
     signature = {
+        "experiment_version": EXPERIMENT_VERSION,
         "environment": config["environment"],
         "training_size": config["training"]["pretrain_transitions"],
         "evaluation": config["evaluation"],
@@ -434,15 +513,15 @@ def shared_data(config, seed, directory):
         return payload
 
     # Collect shared datasets
-    data, metadata = collect(
+    data, metadata = random_rollouts(
         config["environment"], config["training"]["pretrain_transitions"], seed
     )
     held_out = [
-        collect(
+        random_rollouts(
             config["environment"],
             config["evaluation"]["prediction_transitions"],
             2_000_000 + seed * 1000 + i,
-            fixed=setting,
+            fixed_params=setting,
         )[0]
         for i, setting in enumerate(config["evaluation"]["settings"])
     ]
@@ -454,6 +533,20 @@ def shared_data(config, seed, directory):
     }
     torch.save(payload, path)
     return payload
+
+
+def load_checkpoint(path):
+    """Load a trusted checkpoint and reject older experiment definitions."""
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("ppo_backend") != "torchrl":
+        raise ValueError(
+            "Checkpoint uses the previous PPO backend; start a new TorchRL run"
+        )
+    if state.get("experiment_version") != EXPERIMENT_VERSION:
+        raise ValueError(
+            "Checkpoint uses a previous experiment definition; start a new run"
+        )
+    return state
 
 
 def save_checkpoint(
@@ -473,6 +566,7 @@ def save_checkpoint(
 ):
     """Atomically save training state at an episode boundary."""
     state = {
+        "experiment_version": EXPERIMENT_VERSION,
         "ppo_backend": "torchrl",
         "agent": agent.state_dict(),
         "policy_optimizer": policy_optimizer.state_dict(),
@@ -512,7 +606,7 @@ def plot_run(directory):
     for key in rows[0]:
         if key.startswith("return_") and not key.startswith("return_std_"):
             axes[0].plot(x, [float(row[key]) for row in rows], marker=".", label=key)
-        if key.startswith("vector_mse_"):
+        if key in {"reconstruction_loss_ood", "dynamics_loss_ood"}:
             axes[1].plot(x, [float(row[key]) for row in rows], marker=".", label=key)
     for key in ("neural_flops", "estimated_total_operations"):
         axes[2].plot(x, [float(row[key]) for row in rows], marker=".", label=key)
@@ -520,7 +614,7 @@ def plot_run(directory):
     # Label and save
     for axis, label in zip(
         axes,
-        ("Mean evaluation return", "Normalized vector MSE", "Cumulative operations"),
+        ("Mean evaluation return", "Mean squared error", "Cumulative operations"),
     ):
         axis.set_ylabel(label)
         axis.legend(fontsize="small")
@@ -531,47 +625,137 @@ def plot_run(directory):
     plt.close(figure)
 
 
+def match_compute(runs):
+    """Interpolate evaluation metrics only within all runs' shared compute range.
+
+    Args:
+        runs: Mapping from modality to lists of CSV row lists, one per seed.
+
+    Returns:
+        Rows with metric means and seed spread at common operation counts.
+        An empty list means the runs have no shared compute range yet.
+    """
+    series = [rows for seeds in runs.values() for rows in seeds]
+    if not series:
+        return []
+    lower = max(float(rows[0]["selected_operations"]) for rows in series)
+    upper = min(
+        min(float(rows[-1]["selected_operations"]), float(rows[-1]["compute_budget"]))
+        for rows in series
+    )
+    if lower > upper:
+        return []
+    grid = np.unique(
+        [
+            lower,
+            upper,
+            *(
+                float(row["selected_operations"])
+                for rows in series
+                for row in rows
+                if lower <= float(row["selected_operations"]) <= upper
+            ),
+        ]
+    )
+
+    # Interpolate each seed before taking means; never extrapolate a curve.
+    result = []
+    for modality, seeds in runs.items():
+        for metric in ("return_ood", "reconstruction_loss_ood", "dynamics_loss_ood"):
+            values = np.array(
+                [
+                    np.interp(
+                        grid,
+                        [float(row["selected_operations"]) for row in rows],
+                        [float(row[metric]) for row in rows],
+                    )
+                    for rows in seeds
+                ]
+            )
+            for operations, mean, spread in zip(grid, values.mean(0), values.std(0)):
+                result.append(
+                    {
+                        "modality": modality,
+                        "metric": metric,
+                        "selected_operations": operations,
+                        "mean": mean,
+                        "std": spread,
+                        "seeds": len(seeds),
+                        "method": "linear_interpolation",
+                    }
+                )
+    return result
+
+
 def plot_comparison(output, mode):
-    """Overlay paired arms with means and seed spread at common episode points."""
+    """Save OOD comparison curves and interpolated metrics at common compute."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    figure, axes = plt.subplots(3, 1, figsize=(9, 10), sharex=True)
+    runs = {}
     for modality in ("vector", "image", "combined"):
-        runs = []
         for path in sorted(output.glob(f"seed-*/{mode}/{modality}/metrics.csv")):
             with path.open(newline="") as handle:
-                runs.append(
-                    {int(row["episode"]): row for row in csv.DictReader(handle)}
-                )
-        if not runs:
-            continue
+                runs.setdefault(modality, []).append(list(csv.DictReader(handle)))
+    matched = match_compute(runs)
+    with (output / f"comparison-{mode}.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "modality",
+                "metric",
+                "selected_operations",
+                "mean",
+                "std",
+                "seeds",
+                "method",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(matched)
 
-        # Aggregate seeds
-        episodes = sorted(set.intersection(*(set(run) for run in runs)))
-        for axis, key in zip(
-            axes, ("return_familiar", "vector_mse_familiar", "selected_operations")
+    figure, axes = plt.subplots(3, 1, figsize=(9, 10), sharex=True)
+    for modality in runs:
+        for axis, metric in zip(
+            axes, ("return_ood", "reconstruction_loss_ood", "dynamics_loss_ood")
         ):
-            values = np.array(
-                [[float(run[episode][key]) for episode in episodes] for run in runs]
-            )
-            mean, spread = values.mean(0), values.std(0)
-            axis.plot(episodes, mean, marker=".", label=f"{modality} (n={len(runs)})")
-            axis.fill_between(episodes, mean - spread, mean + spread, alpha=0.15)
+            rows = [
+                row
+                for row in matched
+                if row["modality"] == modality and row["metric"] == metric
+            ]
+            if not rows:
+                continue
+            x = np.array([row["selected_operations"] for row in rows])
+            mean = np.array([row["mean"] for row in rows])
+            spread = np.array([row["std"] for row in rows])
+            axis.plot(x, mean, marker=".", label=f"{modality} (n={rows[0]['seeds']})")
+            axis.fill_between(x, mean - spread, mean + spread, alpha=0.15)
     for axis, label in zip(
         axes,
         (
-            "Familiar evaluation return",
-            "Familiar vector MSE",
-            "Selected cumulative operations",
+            "Mean OOD return",
+            "OOD reconstruction MSE",
+            "OOD dynamics MSE",
         ),
     ):
         axis.set_ylabel(label)
-        axis.legend()
+        if matched:
+            axis.legend()
+        else:
+            axis.text(
+                0.5,
+                0.5,
+                "No shared compute range yet",
+                ha="center",
+                transform=axis.transAxes,
+            )
         axis.grid(alpha=0.3)
-    axes[-1].set_xlabel("Completed PPO episodes")
+    axes[-1].set_xlabel(
+        "Cumulative training operations (interpolated within shared range)"
+    )
     figure.tight_layout()
     figure.savefig(output / f"comparison-{mode}.png")
     plt.close(figure)
@@ -590,37 +774,29 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
     np.random.seed(seed)
     torch.manual_seed(seed)
     device = torch.device(config["run"]["device"])
-    agent = Agent(modality, train_encoder=config["training"]["mode"] == "joint").to(
-        device
-    )
+    agent = Agent(modality).to(device)
     actor, critic, ppo_loss = ppo_modules(agent, config["ppo"])
     data = payload["training"]
-    agent.world.mean.copy_(data["next_vector"].mean(0).to(device))
-    agent.world.std.copy_(
-        data["next_vector"].std(0, unbiased=False).clamp_min(1e-6).to(device)
-    )
+    if agent.world.has_vector:
+        agent.world.mean.copy_(data["next_vector"].mean(0).to(device))
+        agent.world.std.copy_(
+            data["next_vector"].std(0, unbiased=False).clamp_min(1e-6).to(device)
+        )
 
     # Configure optimizers
     training = config["training"]
     world_optimizer = torch.optim.Adam(
         agent.world.parameters(), lr=training["world_lr"]
     )
-    policy_groups = [
-        {
-            "params": list(agent.policy.parameters()) + list(agent.value.parameters()),
-            "lr": training["policy_lr"],
-        }
-    ]
-    if training["mode"] == "joint":
-        policy_groups.append(
-            {"params": agent.world.parameters(), "lr": training["world_lr"]}
-        )
-    policy_optimizer = torch.optim.Adam(policy_groups)
+    policy_optimizer = torch.optim.Adam(
+        list(agent.policy.parameters()) + list(agent.value.parameters()),
+        lr=training["policy_lr"],
+    )
 
     # Tracking and environment
     counter = ComputeCounter(agent)
     episodes, transitions, updates, training_seconds = 0, 0, 0, 0.0
-    env = History(
+    env = HistoryStackWrapper(
         config["environment"],
         images=agent.world.has_image,
         counter=counter,
@@ -629,11 +805,7 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
     writer = SummaryWriter(str(directory / "tensorboard"))
     try:
         if resume:
-            state = torch.load(resume, map_location="cpu", weights_only=False)
-            if state.get("ppo_backend") != "torchrl":
-                raise ValueError(
-                    "Checkpoint uses the previous PPO backend; start a new TorchRL run"
-                )
+            state = load_checkpoint(resume)
             original, current = copy.deepcopy(state["config"]), copy.deepcopy(config)
             original["training"].pop("episodes")
             current["training"].pop("episodes")
@@ -645,7 +817,7 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
                 raise ValueError(
                     "Resume requires the same config, seed, and modality; only episode limit may change"
                 )
-            if training["episodes"] < state["episodes"]:
+            if training["episodes"] and training["episodes"] < state["episodes"]:
                 raise ValueError("Episode limit is below the saved episode counter")
             agent.load_state_dict(state["agent"])
             policy_optimizer.load_state_dict(state["policy_optimizer"])
@@ -703,12 +875,12 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
                 updates=updates,
                 neural_flops=counter.neural,
                 estimated_total_operations=counter.neural + counter.extra,
-                selected_operations=counter.neural
-                + (
-                    counter.extra
-                    if config["accounting"]["scope"] == "broader_estimate"
-                    else 0
+                selected_operations=selected_operations(counter, config),
+                compute_budget=training["compute_budget"],
+                budget_overshoot=max(
+                    0, selected_operations(counter, config) - training["compute_budget"]
                 ),
+                budget_reached=int(budget_exhausted(counter, config)),
                 training_seconds=training_seconds,
                 training_return=float(np.mean(scores)) if scores else float("nan"),
                 data_seconds=counter.data_seconds,
@@ -742,7 +914,7 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
             )
             print(
                 f"{training['mode']} seed={seed} {modality}: episode={episodes} "
-                f"return={metrics['return_familiar']:.1f} neural_FLOPs={counter.neural:,}",
+                f"OOD_return={metrics['return_ood']:.1f} neural_FLOPs={counter.neural:,}",
                 flush=True,
             )
 
@@ -750,7 +922,9 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
             record([])
 
         # Train policy
-        while episodes < training["episodes"]:
+        while (
+            not training["episodes"] or episodes < training["episodes"]
+        ) and not budget_exhausted(counter, config):
             start = perf_counter()
             counter.phase = "ppo"
             batch, episodes, scores = rollout(
@@ -774,6 +948,7 @@ def run_arm(config, seed, modality, payload, directory, resume=None, gui=False):
             if (
                 episodes % config["evaluation"]["interval"] == 0
                 or episodes == training["episodes"]
+                or budget_exhausted(counter, config)
             ):
                 record(scores)
         plot_run(directory)
@@ -825,7 +1000,7 @@ def main():
         )
 
     if device.type == "cuda":
-        # Fail before collecting data if this installation cannot execute CUDA kernels.
+        # Check CUDA works
         probe = torch.ones(4, device=device, requires_grad=True)
         probe.square().sum().backward()
 
@@ -838,11 +1013,7 @@ def main():
 
     # Load training checkpoint
     if args.resume:
-        state = torch.load(args.resume, map_location="cpu", weights_only=False)
-        if state.get("ppo_backend") != "torchrl":
-            raise ValueError(
-                "Checkpoint uses the previous PPO backend; start a new TorchRL run"
-            )
+        state = load_checkpoint(args.resume)
         pairs = [(state["seed"], state["modality"])]
     payload_seed, payload = None, None
 

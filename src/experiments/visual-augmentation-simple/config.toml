@@ -13,7 +13,9 @@ max_steps = 500
 
 [training]
 mode = "joint"
-episodes = 1000
+# Zero removes the episode cap; each arm trains to the same operation budget.
+episodes = 0
+compute_budget = 100_000_000_000_000
 pretrain_transitions = 20000
 pretrain_epochs = 10
 batch_size = 256
@@ -21,7 +23,6 @@ world_lr = 0.0003
 policy_lr = 0.0003
 vector_weight = 1.0
 image_weight = 1.0
-joint_weight = 1.0
 world_updates = 1
 
 [ppo]
@@ -37,9 +38,9 @@ max_grad_norm = 0.5
 
 [evaluation]
 interval = 100
-episodes = 1
-prediction_transitions = 1
-# First setting is familiar. The remaining settings are held out.
+episodes = 10
+prediction_transitions = 256
+# Every pair is outside the joint training parameter range.
 settings = [[1.0, 0.0025], [0.25, 0.0025], [2.0, 0.0025], [1.0, 0.01], [0.25, 0.01], [2.0, 0.01]]
 
 [accounting]

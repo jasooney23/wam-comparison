@@ -1,8 +1,11 @@
-"""Shape-based arithmetic accounting, independent of CUDA kernel selection."""
+"""Shape-based arithmetic accounting and elapsed-time compute estimates."""
 
 from contextlib import contextmanager
+from math import isfinite
+from time import perf_counter
 
-from torch import nn
+from torch import cuda, nn
+from torch import device as torch_device
 
 
 class ComputeCounter:
@@ -110,3 +113,88 @@ class ComputeCounter:
         """Remove instrumentation hooks."""
         for handle in self.handles:
             handle.remove()
+
+
+class ElapsedComputeCounter:
+    """Estimate compute as elapsed seconds times a fixed hardware FLOP/s rate.
+
+    This measures equivalent compute capacity, including idle time inside each
+    measured block, rather than executed arithmetic. CUDA synchronization waits
+    for all work on the selected device at each block boundary.
+
+    The RTX 4050 Laptop GPU default is a derived FP32 peak estimate:
+    2,560 CUDA cores * 2.370 GHz maximum boost * 2 operations per multiply-add
+    = 12.1344 TFLOP/s. Actual clocks and throughput vary by laptop and workload.
+    This rate excludes Tensor Core and sparse arithmetic.
+
+    Sources:
+        Core count and boost clock:
+        https://www.nvidia.com/en-us/geforce/laptops/compare/
+        Multiply-add counting convention:
+        https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html
+
+    Args:
+        device: CPU or CUDA device on which the measured workload runs.
+        flops_per_second: Positive finite hardware rate. Required for CPU and
+            CUDA devices other than the RTX 4050 Laptop GPU. Override the default
+            when using a different clock, precision, or measured throughput.
+    """
+
+    def __init__(self, device="cuda", flops_per_second=None):
+        # Resolve the device and its rate once for the whole measurement.
+        self.device = torch_device(device)
+        if self.device.type not in {"cpu", "cuda"}:
+            raise ValueError("Only CPU and CUDA devices are supported")
+        if self.device.type == "cuda":
+            if not cuda.is_available():
+                raise ValueError("CUDA requested but unavailable")
+            if self.device.index is None:
+                self.device = torch_device("cuda", cuda.current_device())
+            name = cuda.get_device_name(self.device)
+            if (
+                flops_per_second is None
+                and name == "NVIDIA GeForce RTX 4050 Laptop GPU"
+            ):
+                flops_per_second = 2560 * 2.370e9 * 2
+        if flops_per_second is None:
+            raise ValueError(
+                "An explicit flops_per_second rate is required for this hardware"
+            )
+        self.flops_per_second = float(flops_per_second)
+        if not isfinite(self.flops_per_second) or self.flops_per_second <= 0:
+            raise ValueError("flops_per_second must be positive and finite")
+        self.elapsed_seconds = 0.0
+        self._measuring = False
+
+    @property
+    def estimated_flops(self):
+        """Return estimated FLOPs for completed measurement blocks."""
+        return self.elapsed_seconds * self.flops_per_second
+
+    def _synchronize(self):
+        if self.device.type == "cuda":
+            cuda.synchronize(self.device)
+
+    @contextmanager
+    def measure(self):
+        """Accumulate elapsed time, including time spent in a failing block.
+
+        Yields:
+            ElapsedComputeCounter: This counter.
+
+        Raises:
+            RuntimeError: A measurement is already running on this counter.
+        """
+        if self._measuring:
+            raise RuntimeError("Measurement blocks on the same counter cannot overlap")
+        self._synchronize()
+        start = perf_counter()
+        self._measuring = True
+        try:
+            yield self
+        finally:
+            try:
+                self._synchronize()
+                self.elapsed_seconds += perf_counter() - start
+            finally:
+                self._measuring = False

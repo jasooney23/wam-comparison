@@ -1,5 +1,6 @@
 """Behavior checks for physics, training modes, accounting, and resume."""
 
+import csv
 import importlib.util
 import tomllib
 from pathlib import Path
@@ -14,7 +15,10 @@ from torchrl.objectives.value import GAE
 
 from common.compute import ComputeCounter
 from common.environments.cartpole import CartPoleEnv
-from common.environments.history import History, collect
+from common.environments.history_stack_wrapper import (
+    HistoryStackWrapper,
+    random_rollouts,
+)
 from common.models import Agent, WorldModel
 
 EXPERIMENT = (
@@ -85,7 +89,7 @@ def test_damping_satisfies_coupled_equations():
 
 
 def test_history_resets_parameters_and_truncates(config):
-    env = History(config["environment"], images=False)
+    env = HistoryStackWrapper(config["environment"], images=False)
     try:
         observation, info = env.reset(seed=5)
         assert env.observation_space.contains(observation)
@@ -93,7 +97,11 @@ def test_history_resets_parameters_and_truncates(config):
             observation["vector"], np.repeat(observation["vector"][:1], 4, axis=0)
         )
         mass = env.unwrapped.masscart
-        assert 0.5 <= mass <= 1.5
+        assert (
+            config["environment"]["cart_mass"][0]
+            <= mass
+            <= config["environment"]["cart_mass"][1]
+        )
         for _ in range(5):
             _, _, _terminated, truncated, _ = env.step(0)
             assert env.unwrapped.masscart == mass
@@ -107,8 +115,8 @@ def test_history_resets_parameters_and_truncates(config):
 
 
 def test_render_has_no_parameter_cues_and_preserves_angle(config):
-    a = History(config["environment"], fixed=(0.25, 0.0))
-    b = History(config["environment"], fixed=(2.0, 0.01))
+    a = HistoryStackWrapper(config["environment"], fixed_params=(0.25, 0.0))
+    b = HistoryStackWrapper(config["environment"], fixed_params=(2.0, 0.01))
     try:
         first, _ = a.reset(seed=0)
         second, _ = b.reset(seed=0)
@@ -140,10 +148,21 @@ def test_model_shapes_and_gradients(modality):
         "next_image": torch.randint(256, (3, 64, 64), dtype=torch.uint8),
     }
     assert model.encode(batch["vector"], batch["image"]).shape == (3, 16)
-    vector, image = model(batch["vector"], batch["image"], batch["action"])
-    assert vector.shape == (3, 3)
-    assert (image is None) == (modality == "vector")
-    loss, _, _ = model.loss(batch)
+    predictions = model(batch["vector"], batch["image"], batch["action"])
+    if model.has_vector:
+        assert predictions["vector"].shape == (3, 4, 3)
+    if model.has_image:
+        assert predictions["image"].shape == (3, 4, 64, 64)
+    batch = {
+        key: value
+        for key, value in batch.items()
+        if (model.has_vector or "vector" not in key)
+        and (model.has_image or "image" not in key)
+    }
+    loss, metrics = model.loss(batch)
+    torch.testing.assert_close(
+        loss, metrics["reconstruction_loss"] + metrics["dynamics_loss"]
+    )
     loss.backward()
     assert all(
         p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()
@@ -196,8 +215,8 @@ def test_gae_bootstraps_truncations_without_reset_leakage():
 def test_training_mode_updates_only_intended_parameters(config, mode, modality):
     torch.manual_seed(0)
     config["training"]["mode"] = mode
-    data, _ = collect(config["environment"], 8, 0)
-    agent = Agent(modality, train_encoder=mode == "joint")
+    data, _ = random_rollouts(config["environment"], 8, 0)
+    agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
     with torch.no_grad():
         data = critic(actor(TensorDict(data, batch_size=[8])))
@@ -208,8 +227,6 @@ def test_training_mode_updates_only_intended_parameters(config, mode, modality):
     counter = ComputeCounter(agent)
     world_optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
     policy_parameters = list(agent.policy.parameters()) + list(agent.value.parameters())
-    if mode == "joint":
-        policy_parameters += list(agent.world.parameters())
     policy_optimizer = torch.optim.Adam(policy_parameters, lr=0.001)
     before_world = [p.clone() for p in agent.world.parameters()]
     before_policy = [p.clone() for p in agent.policy.parameters()]
@@ -231,8 +248,10 @@ def test_training_mode_updates_only_intended_parameters(config, mode, modality):
 
 def test_resume_matches_uninterrupted_training(config, tmp_path):
     config["training"]["mode"] = "joint"
-    data, metadata = collect(config["environment"], 16, 0)
-    held_out, _ = collect(config["environment"], 8, 20, fixed=(1.0, 0.0025))
+    data, metadata = random_rollouts(config["environment"], 16, 0)
+    held_out, _ = random_rollouts(
+        config["environment"], 8, 20, fixed_params=(1.0, 0.0025)
+    )
     payload = {"training": data, "held_out": [held_out], "collection": metadata}
     directory = tmp_path / "arm"
     training.run_arm(config, 0, "vector", payload, directory)
@@ -258,10 +277,12 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
         training.run_arm(config, 0, "vector", payload, directory, legacy)
 
 
-def test_joint_ppo_loss_reaches_encoder(config):
-    agent = Agent("vector", train_encoder=True)
+@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+def test_ppo_and_world_losses_have_separate_gradients(config, modality):
+    agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
-    data = TensorDict({"vector": torch.randn(4, 4, 3)}, batch_size=[4])
+    data, _ = random_rollouts(config["environment"], 4, 0)
+    data = training.to_device(data, torch.arange(4), "cpu", agent.world)
     with torch.no_grad():
         critic(actor(data))
     data["advantage"] = torch.ones(4, 1)
@@ -270,9 +291,21 @@ def test_joint_ppo_loss_reaches_encoder(config):
     # No prediction loss contributes to either gradient.
     losses = ppo_loss(data)
     losses["loss_objective"].backward(retain_graph=True)
-    assert agent.world.projection.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in agent.world.parameters())
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in agent.policy.parameters()
+    )
     agent.zero_grad(set_to_none=True)
     losses["loss_critic"].backward()
+    assert all(p.grad is None for p in agent.world.parameters())
+    assert any(
+        p.grad is not None and p.grad.abs().sum() > 0 for p in agent.value.parameters()
+    )
+
+    agent.zero_grad(set_to_none=True)
+    agent.world.loss(data)[0].backward()
+    assert all(p.grad is None for p in agent.policy.parameters())
+    assert all(p.grad is None for p in agent.value.parameters())
     assert agent.world.projection.weight.grad.abs().sum() > 0
 
 
@@ -282,7 +315,7 @@ def test_single_transition_rollout_bootstraps_time_limit(config):
     agent = Agent("vector")
     actor, critic, _ = training.ppo_modules(agent, config["ppo"])
     counter = ComputeCounter(agent)
-    env = History(config["environment"], images=False, counter=counter)
+    env = HistoryStackWrapper(config["environment"], images=False, counter=counter)
     try:
         data, episodes, scores = training.rollout(
             agent, actor, critic, env, config, 0, 0, "cpu", counter
@@ -321,3 +354,181 @@ def test_cached_data_rejects_changed_physics(config, tmp_path):
     config["environment"]["cart_mass"] = [0.6, 1.4]
     with pytest.raises(ValueError, match="Data configuration changed"):
         training.shared_data(config, 0, tmp_path)
+
+
+def test_losses_average_modalities_and_use_shifted_history():
+    model = WorldModel("combined")
+    for parameter in model.parameters():
+        nn.init.zeros_(parameter)
+    model.mean.fill_(1)
+    model.std.fill_(2)
+    batch = {
+        "vector": torch.tensor([1.0, 3.0, 5.0, 7.0]).view(1, 4, 1).expand(2, 4, 3),
+        "next_vector": torch.full((2, 3), 9.0),
+        "image": torch.tensor([0, 0, 0, 255], dtype=torch.uint8)
+        .view(1, 4, 1, 1)
+        .expand(2, 4, 64, 64),
+        "next_image": torch.full((2, 64, 64), 128, dtype=torch.uint8),
+        "action": torch.tensor([0, 1]),
+    }
+    loss, metrics = model.loss(batch, vector_weight=2, image_weight=3)
+    # Vector targets are [0, 1, 2, 3] and [1, 2, 3, 4]; images decode to 0.5.
+    image_dynamics = (3 * 0.25 + (0.5 - 128 / 255) ** 2) / 4
+    assert metrics["vector_reconstruction_loss"].item() == pytest.approx(3.5)
+    assert metrics["vector_dynamics_loss"].item() == pytest.approx(7.5)
+    assert metrics["image_reconstruction_loss"].item() == pytest.approx(0.25)
+    assert metrics["image_dynamics_loss"].item() == pytest.approx(image_dynamics)
+    assert metrics["reconstruction_loss"].item() == pytest.approx(2 * 3.5 + 3 * 0.25)
+    assert loss.item() == pytest.approx(2 * (3.5 + 7.5) + 3 * (0.25 + image_dynamics))
+
+
+def test_reconstruction_trains_encoder_and_decoder_without_dynamics(config):
+    model = WorldModel("combined")
+    data, _ = random_rollouts(config["environment"], 4, 0)
+    _, metrics = model.loss(data)
+    metrics["reconstruction_loss"].backward()
+    assert all(p.grad is None for p in model.dynamics.parameters())
+    for module in (
+        model.vector_encoder,
+        model.image_encoder,
+        model.vector_decoder,
+        model.image_decoder,
+    ):
+        assert any(
+            p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters()
+        )
+
+
+@pytest.mark.parametrize("pair", [[1.0, 0.0], [1.01, 0.0001]])
+def test_evaluation_rejects_training_parameters(config, pair):
+    config["evaluation"]["settings"] = [pair]
+    with pytest.raises(ValueError, match="outside the training"):
+        training.validate(config)
+
+
+@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality):
+    agent = Agent(modality)
+    actor, _, _ = training.ppo_modules(agent, config["ppo"])
+    held_out, _ = random_rollouts(
+        config["environment"], 5, 20, fixed_params=config["evaluation"]["settings"][0]
+    )
+    counter = ComputeCounter(agent)
+    before = {key: value.clone() for key, value in agent.state_dict().items()}
+    before_counter = counter.state_dict()
+    metrics = training.evaluate(agent, actor, [held_out], config, 0, "cpu", counter)
+    assert metrics == training.evaluate(
+        agent, actor, [held_out], config, 0, "cpu", counter
+    )
+    assert counter.state_dict() == before_counter
+    for key, value in agent.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    assert metrics["return_ood"] == 5
+    _, expected = agent.world.loss(held_out)
+    for key, value in expected.items():
+        assert metrics[f"{key}_ood"] == pytest.approx(value.item())
+    assert not any("familiar" in key for key in metrics)
+    counter.close()
+
+
+def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
+    def rows(costs, returns):
+        return [
+            {
+                "selected_operations": cost,
+                "compute_budget": 100,
+                "return_ood": score,
+                "reconstruction_loss_ood": score / 10,
+                "dynamics_loss_ood": score / 5,
+            }
+            for cost, score in zip(costs, returns)
+        ]
+
+    runs = {
+        "vector": [rows([10, 30, 110], [1, 3, 11]), rows([20, 40, 120], [3, 5, 13])],
+        "combined": [rows([50, 80, 130], [10, 16, 26])],
+    }
+    matched = training.match_compute(runs)
+    assert min(row["selected_operations"] for row in matched) == 50
+    assert max(row["selected_operations"] for row in matched) == 100
+    vector = next(
+        row
+        for row in matched
+        if row["modality"] == "vector" and row["metric"] == "return_ood"
+    )
+    assert vector["mean"] == pytest.approx(5.5)
+    assert vector["std"] == pytest.approx(0.5)
+    assert vector["seeds"] == 2
+    assert (
+        training.match_compute(
+            {"vector": [rows([1, 2], [1, 2])], "combined": [rows([3, 4], [3, 4])]}
+        )
+        == []
+    )
+
+    # Exercise the nonempty CSV and plot path as well as the interpolation.
+    for modality, seeds in runs.items():
+        for seed, data in enumerate(seeds):
+            directory = tmp_path / f"seed-{seed}" / "joint" / modality
+            directory.mkdir(parents=True)
+            with (directory / "metrics.csv").open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(data[0]))
+                writer.writeheader()
+                writer.writerows(data)
+    training.plot_comparison(tmp_path, "joint")
+    with (tmp_path / "comparison-joint.csv").open(newline="") as handle:
+        exported = list(csv.DictReader(handle))
+    assert len(exported) == len(matched)
+    assert all(row["method"] == "linear_interpolation" for row in exported)
+    assert (tmp_path / "comparison-joint.png").is_file()
+
+
+def test_budget_stops_training_without_episode_cap(config, tmp_path):
+    config["training"].update(episodes=0, compute_budget=2_000_000)
+    config["evaluation"]["interval"] = 100
+    data, metadata = random_rollouts(config["environment"], 8, 0)
+    held_out, _ = random_rollouts(
+        config["environment"], 4, 20, fixed_params=config["evaluation"]["settings"][0]
+    )
+    directory = tmp_path / "budget"
+    training.run_arm(
+        config,
+        0,
+        "vector",
+        {"training": data, "held_out": [held_out], "collection": metadata},
+        directory,
+    )
+    with (directory / "metrics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    final = rows[-1]
+    assert int(final["episode"]) > 0
+    assert int(final["budget_reached"]) == 1
+    assert (
+        int(final["budget_overshoot"]) == int(final["selected_operations"]) - 2_000_000
+    )
+    assert len(rows) == 2  # Initial evaluation and the final budget boundary.
+    checkpoint = training.load_checkpoint(
+        directory / f"episode-{int(final['episode']):06d}.pt"
+    )
+    assert checkpoint["counter"]["neural"] == int(final["selected_operations"])
+
+    config["training"]["compute_budget"] = 1
+    with pytest.raises(ValueError, match="exhausted during pretraining"):
+        training.run_arm(
+            config,
+            0,
+            "vector",
+            {"training": data, "held_out": [held_out], "collection": metadata},
+            tmp_path / "too-small",
+        )
+
+
+def test_old_experiment_artifacts_are_rejected(config, tmp_path):
+    payload = training.shared_data(config, 0, tmp_path)
+    payload["signature"].pop("experiment_version")
+    torch.save(payload, tmp_path / "data.pt")
+    with pytest.raises(ValueError, match="Data configuration changed"):
+        training.shared_data(config, 0, tmp_path)
+    torch.save({"ppo_backend": "torchrl"}, tmp_path / "old.pt")
+    with pytest.raises(ValueError, match="previous experiment definition"):
+        training.load_checkpoint(tmp_path / "old.pt")
