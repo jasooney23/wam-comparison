@@ -47,8 +47,8 @@ def test_synthesized_dataset_is_reproducible(config):
     )
     generator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(generator)
-    first, _ = generator.generate(config["environment"], 4, 17)
-    second, _ = generator.generate(config["environment"], 4, 17)
+    first = generator.generate(config["environment"], 4, 17)
+    second = generator.generate(config["environment"], 4, 17)
     for key in first:
         torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
     assert first["image"].shape == (4, 4, 64, 64)
@@ -151,7 +151,7 @@ def test_registered_wrapper_passes_gym_checks(config):
     check_env(env, skip_render_check=True)
 
 
-@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+@pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_model_shapes_and_gradients(modality):
     model = WorldModel(modality)
     batch = {
@@ -163,15 +163,13 @@ def test_model_shapes_and_gradients(modality):
     }
     assert model.encode(batch["vector"], batch["image"]).shape == (3, 16)
     predictions = model(batch["vector"], batch["image"], batch["action"])
-    if model.has_vector:
-        assert predictions["vector"].shape == (3, 4, 3)
+    assert predictions["vector"].shape == (3, 4, 3)
     if model.has_image:
         assert predictions["image"].shape == (3, 4, 64, 64)
     batch = {
         key: value
         for key, value in batch.items()
-        if (model.has_vector or "vector" not in key)
-        and (model.has_image or "image" not in key)
+        if model.has_image or "image" not in key
     }
     loss, metrics = model.loss(batch)
     torch.testing.assert_close(
@@ -201,10 +199,10 @@ def test_gae_bootstraps_truncations_without_reset_leakage():
     torch.testing.assert_close(data["value_target"], torch.tensor([[3.7], [1.0]]))
 
 
-@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+@pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_agent_updates_only_policy_parameters(config, modality):
     torch.manual_seed(0)
-    data, _ = random_rollouts(config["environment"], 8, 0)
+    data = random_rollouts(config["environment"], 8, 0)
     agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
     with torch.no_grad():
@@ -232,11 +230,15 @@ def test_agent_updates_only_policy_parameters(config, modality):
 
 
 def test_resume_matches_uninterrupted_training(config, tmp_path):
-    data, metadata = random_rollouts(config["environment"], 16, 0)
-    held_out, _ = random_rollouts(
-        config["environment"], 8, 20, fixed_params=(1.0, 0.0025)
+    data = random_rollouts(config["environment"], 16, 0)
+    held_out = random_rollouts(
+        config["environment"],
+        8,
+        20,
+        fixed_params=(1.0, 0.0025),
+        horizon=config["evaluation"]["horizon"],
     )
-    payload = {"training": data, "held_out": [held_out], "collection": metadata}
+    payload = {"training": data, "held_out": [held_out]}
     directory = tmp_path / "arm"
     training.run_arm(config, 0, "vector", payload, directory)
     complete = torch.load(directory / "episode-000002.pt", weights_only=False)
@@ -248,9 +250,21 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
         torch.testing.assert_close(
             complete["agent"][key], resumed["agent"][key], rtol=0, atol=0
         )
-    assert complete["counter"] == resumed["counter"]
-    assert complete["transitions"] == resumed["transitions"]
+    for key in ("world_updates", "agent_updates", "world_training_seconds"):
+        assert complete["counter"][key] == resumed["counter"][key]
+    assert complete["counter"]["agent_training_seconds"] > 0
+    assert resumed["counter"]["agent_training_seconds"] > 0
+    assert complete["agent_environment_steps"] == resumed["agent_environment_steps"]
     assert (directory / "curves.png").is_file()
+    with (directory / "metrics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert int(rows[0]["agent_environment_steps"]) == 0
+    assert float(rows[0]["agent_training_seconds"]) == 0
+    assert float(rows[0]["world_training_seconds"]) > 0
+    assert int(rows[-1]["agent_environment_steps"]) > 0
+    assert float(rows[-1]["agent_training_seconds"]) > 0
+    assert "transitions" not in rows[0]
+    assert "training_seconds" not in rows[0]
 
     # Reject checkpoints from the custom backend.
     complete.pop("ppo_backend")
@@ -260,11 +274,11 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
         training.run_arm(config, 0, "vector", payload, directory, legacy)
 
 
-@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+@pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_ppo_and_world_losses_have_separate_gradients(config, modality):
     agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
-    data, _ = random_rollouts(config["environment"], 4, 0)
+    data = random_rollouts(config["environment"], 4, 0)
     data = training.to_device(data, torch.arange(4), "cpu", agent.world)
     with torch.no_grad():
         critic(actor(data))
@@ -315,17 +329,26 @@ def test_single_transition_rollout_bootstraps_time_limit(config):
 
 
 def write_dataset(config, tmp_path):
-    data, metadata = random_rollouts(config["environment"], 32, 0)
+    data = random_rollouts(config["environment"], 32, 0)
     path = tmp_path / "dataset.pt"
     torch.save(
         {
             "environment": config["environment"],
             "training": data,
-            "collection": metadata,
         },
         path,
     )
     config["training"]["dataset"] = str(path)
+
+
+def test_old_dataset_collection_field_is_ignored(config, tmp_path):
+    write_dataset(config, tmp_path)
+    path = tmp_path / "dataset.pt"
+    dataset = torch.load(path, weights_only=False)
+    dataset["collection"] = {"collection_seconds": 123.0}
+    torch.save(dataset, path)
+    payload = training.shared_data(config, 0, tmp_path)
+    assert "collection" not in payload
 
 
 def test_cached_data_rejects_changed_physics(config, tmp_path):
@@ -364,7 +387,7 @@ def test_losses_average_modalities_and_use_shifted_history():
 
 def test_reconstruction_trains_encoder_and_decoder_without_dynamics(config):
     model = WorldModel("combined")
-    data, _ = random_rollouts(config["environment"], 4, 0)
+    data = random_rollouts(config["environment"], 4, 0)
     _, metrics = model.loss(data)
     metrics["reconstruction_loss"].backward()
     assert all(p.grad is None for p in model.dynamics.parameters())
@@ -386,11 +409,12 @@ def test_evaluation_rejects_training_parameters(config, pair):
         training.validate(config)
 
 
-@pytest.mark.parametrize("modality", ["vector", "image", "combined"])
+@pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality):
+    config["evaluation"]["horizon"] = 0
     agent = Agent(modality)
     actor, _, _ = training.ppo_modules(agent, config["ppo"])
-    held_out, _ = random_rollouts(
+    held_out = random_rollouts(
         config["environment"], 5, 20, fixed_params=config["evaluation"]["settings"][0]
     )
     before = {key: value.clone() for key, value in agent.state_dict().items()}
@@ -399,20 +423,70 @@ def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality
     for key, value in agent.state_dict().items():
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
     assert metrics["return_ood"] == 5
-    _, expected = agent.world.loss(held_out)
-    for key, value in expected.items():
-        assert metrics[f"{key}_ood"] == pytest.approx(value.item())
+    with torch.no_grad():
+        latent = agent.world.encode(held_out["vector"], held_out["image"])
+        prediction = agent.world.decode(
+            agent.world.predict(latent, held_out["action"])
+        )["vector"][:, -1]
+        expected = (
+            (prediction * agent.world.std + agent.world.mean - held_out["next_vector"])
+            .abs()
+            .mean(0)
+        )
+    for name, value in zip(training.STATE_NAMES, expected):
+        assert metrics[f"{name}_l2_ood"] == pytest.approx(value.item())
+    assert not any("loss" in key for key in metrics)
     assert not any("familiar" in key for key in metrics)
+
+
+def test_horizon_windows_and_metrics(config):
+    config["evaluation"]["horizon"] = 4
+    data = random_rollouts(
+        config["environment"],
+        5,
+        20,
+        fixed_params=config["evaluation"]["settings"][0],
+        horizon=4,
+    )
+    assert data["actions"].shape == (5, 4)
+    assert data["targets"].shape == (5, 5, 3)
+    torch.testing.assert_close(data["targets"][:, 0], data["vector"][:, -1])
+
+    agent = Agent("vector")
+    actor, _, _ = training.ppo_modules(agent, config["ppo"])
+    metrics = training.evaluate(agent, actor, [data], config, 0, "cpu")
+    for step in range(5):
+        for name in training.STATE_NAMES:
+            assert f"{name}_l2_h{step}_ood" in metrics
+    with torch.no_grad():
+        latent = agent.world.encode(data["vector"])
+        for step in range(5):
+            if step:
+                latent = agent.world.predict(latent, data["actions"][:, step - 1])
+            prediction = agent.world.decode(latent)["vector"][:, -1]
+            expected = (
+                (
+                    prediction * agent.world.std
+                    + agent.world.mean
+                    - data["targets"][:, step]
+                )
+                .abs()
+                .mean(0)
+            )
+            for name, error in zip(training.STATE_NAMES, expected):
+                assert metrics[f"{name}_l2_h{step}_ood"] == pytest.approx(error.item())
+    assert not any("image" in key or "loss" in key for key in metrics)
 
 
 def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     def rows(costs, returns):
         return [
             {
-                "transitions": cost,
+                "agent_environment_steps": cost,
                 "return_ood": score,
-                "reconstruction_loss_ood": score / 10,
-                "dynamics_loss_ood": score / 5,
+                "cart_position_l2_ood": score / 10,
+                "cart_velocity_l2_ood": score / 5,
+                "pole_angle_l2_ood": score / 20,
             }
             for cost, score in zip(costs, returns)
         ]
@@ -422,8 +496,8 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
         "combined": [rows([50, 80, 130], [10, 16, 26])],
     }
     matched = training.match_compute(runs)
-    assert min(row["transitions"] for row in matched) == 50
-    assert max(row["transitions"] for row in matched) == 110
+    assert min(row["agent_environment_steps"] for row in matched) == 50
+    assert max(row["agent_environment_steps"] for row in matched) == 110
     vector = next(
         row
         for row in matched
@@ -454,6 +528,22 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     assert len(exported) == len(matched)
     assert all(row["method"] == "linear_interpolation" for row in exported)
     assert (tmp_path / "comparison.png").is_file()
+
+
+def test_comparison_accepts_rollout_metrics(tmp_path):
+    for modality in ("vector", "combined"):
+        directory = tmp_path / "seed-0" / modality
+        directory.mkdir(parents=True)
+        row = {"agent_environment_steps": 10, "return_ood": 5}
+        row.update({key: 1.0 for key in training.evaluation_metrics(4)[1:]})
+        with (directory / "metrics.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+    training.plot_comparison(tmp_path)
+    with (tmp_path / "comparison.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert {row["metric"] for row in rows} == set(training.evaluation_metrics(4))
 
 
 def test_old_experiment_artifacts_are_rejected(config, tmp_path):

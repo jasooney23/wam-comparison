@@ -38,5 +38,6 @@ max_grad_norm = 0.5
 interval = 100
 episodes = 10
 prediction_transitions = 256
+horizon = 4
 # Every pair is outside the joint training parameter range.
 settings = [[1.0, 0.0025], [0.25, 0.0025], [2.0, 0.0025], [1.0, 0.01], [0.25, 0.01], [2.0, 0.01]]

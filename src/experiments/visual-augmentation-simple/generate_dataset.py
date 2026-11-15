@@ -67,10 +67,7 @@ def generate(settings, count, seed):
                 last_report = now
     finally:
         env.close()
-    return {key: torch.from_numpy(value) for key, value in arrays.items()}, {
-        "collection_seconds": perf_counter() - start,
-        "seed": seed,
-    }
+    return {key: torch.from_numpy(value) for key, value in arrays.items()}
 
 
 def main():
@@ -92,7 +89,7 @@ def main():
     if path.exists():
         raise FileExistsError(f"Dataset already exists: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    data, metadata = generate(
+    data = generate(
         config["environment"], config["training"]["pretrain_transitions"], args.seed
     )
     print(f"Saving dataset to {path}...", flush=True)
@@ -100,7 +97,6 @@ def main():
         {
             "environment": config["environment"],
             "training": data,
-            "collection": metadata,
         },
         path,
     )

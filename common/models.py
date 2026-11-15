@@ -121,21 +121,16 @@ class WorldModel(nn.Module):
     """Encode four observations and predict the next observation given an action.
 
     Args:
-        modality: One of vector, image, or combined.
+        modality: Vector or combined.
     """
 
     def __init__(self, modality: str):
         super().__init__()
-        if modality not in {"vector", "image", "combined"}:
+        if modality not in {"vector", "combined"}:
             raise ValueError(f"Unknown modality: {modality}")
-        self.modality = modality
-        self.has_vector = modality != "image"
         self.has_image = modality != "vector"
-        if self.has_vector:
-            self.vector_encoder = MLP(12, 16, [32])
-            self.vector_decoder = nn.Sequential(
-                MLP(16, 12, [32]), nn.Unflatten(1, (4, 3))
-            )
+        self.vector_encoder = MLP(12, 16, [32])
+        self.vector_decoder = nn.Sequential(MLP(16, 12, [32]), nn.Unflatten(1, (4, 3)))
         if self.has_image:
             self.image_encoder = nn.Sequential(
                 *CNN(
@@ -163,18 +158,14 @@ class WorldModel(nn.Module):
                     output_act_fn=nn.Sigmoid,
                 ),
             )
-        self.projection = nn.Linear(16 * (self.has_vector + self.has_image), 16)
+        self.projection = nn.Linear(16 * (1 + self.has_image), 16)
         self.dynamics = MLP(16 + 2, 16, [32])  # z = 16, cartpole act = 2
         self.register_buffer("mean", torch.zeros(3))
         self.register_buffer("std", torch.ones(3))
 
     def encode(self, vector=None, image=None):
         """Encode a batch of four-frame histories."""
-        features = []
-        if self.has_vector:
-            features.append(
-                self.vector_encoder(((vector - self.mean) / self.std).flatten(1))
-            )
+        features = [self.vector_encoder(((vector - self.mean) / self.std).flatten(1))]
         if self.has_image:
             features.append(self.image_encoder(image.float() / 255))
         return self.projection(torch.cat(features, dim=1))
@@ -186,14 +177,10 @@ class WorldModel(nn.Module):
 
     def decode(self, latent):
         """Reconstruct four-frame histories for the active modalities."""
-        return {
-            name: getattr(self, f"{name}_decoder")(latent)
-            for name, enabled in (
-                ("vector", self.has_vector),
-                ("image", self.has_image),
-            )
-            if enabled
-        }
+        result = {"vector": self.vector_decoder(latent)}
+        if self.has_image:
+            result["image"] = self.image_decoder(latent)
+        return result
 
     def forward(self, vector, image, action):
         """Predict the next four-frame observation from the current history."""

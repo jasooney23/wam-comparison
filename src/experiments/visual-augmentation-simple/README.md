@@ -69,8 +69,7 @@ frame, before any episode reset. The dataset stores only that new target frame
 to avoid duplicating histories. Vector targets use training-only normalization;
 image targets use pixels scaled to `[0, 1]`.
 
-Vector-only models have no image decoder or loss. Image-only models have no
-vector decoder or loss and require no vector labels. Combined models train
+Vector-only models have no image decoder or loss. Combined models train
 both branches end to end. The default comparison uses vector and combined.
 
 The policy consumes the encoded latent. The world model is frozen throughout
@@ -107,13 +106,19 @@ boundaries. A setting is OOD if mass, damping, or both fall outside those ranges
 Evaluation covers every configured setting with the same episode count, using
 deterministic actions and identical reset seeds across modalities and evaluation
 intervals. Fixed independent random-action datasets use paired collection seeds.
-Defaults use 10 control episodes and 256 prediction transitions per setting.
+Defaults use 10 control episodes and 256 prediction windows per setting.
+`evaluation.horizon = 4` measures direct reconstruction (step 0) and four
+successive latent dynamics steps. The same uniformly sampled action sequence is
+used for each modality. Windows stop at episode boundaries. At each step the
+model decodes its current latent state without encoding a new observation.
+Set `evaluation.horizon = 0` to measure only the immediate one-step prediction.
 
-Metrics include return, reconstruction loss, and dynamics loss for each setting
-(`heldout_N`) and their uniform mean (`ood`). Each loss also has separate vector
-and image metrics when those modalities are active. Evaluation cannot update
-parameters, normalization, or training counters. No multi-step rollout evaluation
-is included.
+Metrics include episodic return and separate state L2 errors for cart
+position, cart velocity, and pole angle for each setting (`heldout_N`) and their
+uniform mean (`ood`). Each scalar L2 error is the mean absolute difference in
+physical units over held-out windows. Metrics have `_h0` through `_h4` suffixes
+at the default horizon. Image output is not evaluated.
+Evaluation cannot update parameters, normalization, or training counters.
 
 Images depict position and angle already present in vector history. Temporal
 vectors also expose angular velocity. A visual advantage is therefore not
@@ -123,12 +128,13 @@ not a controlled test of input information alone. Episode-return saturation at
 
 ## Compute measures
 
-Each run records cumulative training wall time, environment steps, world-model
-optimizer updates, and agent optimizer updates. Environment steps include shared
-synthesized training data and policy rollouts; world-model updates include
-pretraining. Training time includes the original shared training-data collection
-and training, and excludes evaluation and held-out data collection. CUDA work is
-synchronized at training boundaries. Collection time is charged to each arm.
+Each run records separate wall-clock training seconds and optimizer updates for
+the world model and agent. `world_training_seconds` covers only pretraining
+minibatch loops. `agent_training_seconds` covers policy rollout collection and
+PPO update loops. `agent_environment_steps` counts only policy rollout steps;
+the world model has no environment-step measure. Dataset collection, evaluation,
+logging, and checkpoint writing are excluded from both timers. CUDA work is synchronized
+before each training timer stops.
 These measures describe different aspects of compute and do not imply equal cost
 per step or update across modalities.
 
@@ -137,22 +143,22 @@ per step or update across modalities.
 Under `run.output`:
 
 - `seed-N/data.pt`: held-out data and dataset settings.
-- `seed-N/MODALITY/config.json`, `collection.json`: resolved settings and collection metadata.
-- `metrics.csv`: episode counts, scores, errors, compute, transitions, updates, and timing.
+- `seed-N/MODALITY/config.json`: resolved settings.
+- `metrics.csv`: episode counts, scores, errors, separate training times and updates, and agent environment steps.
 - `world-epoch-NNN.pt`: pretrained world-model checkpoints.
 - `episode-NNNNNN.pt`: resumable model and optimizer checkpoints, including update counts.
-- `curves.png`: all-setting scores, OOD WAM losses, and training counts against episodes.
+- `curves.png`: all-setting scores, OOD state errors, and training counts against episodes.
 - `tensorboard/`: scalar event logs, including pretraining losses.
-- `comparison.png`: mean OOD return and WAM losses at common environment steps, with seed means ± one standard deviation.
+- `comparison.png`: mean OOD return and state errors at common environment steps, with seed means ± one standard deviation.
 - `comparison.csv`: the matched values, environment steps, seed counts, and interpolation method.
 
 ```powershell
 uv run tensorboard --logdir outputs/visual-augmentation-simple
 ```
 
-Each seed's evaluations are linearly interpolated onto common environment steps
-before calculating means and seed spread. The range starts at the largest
-pretraining step count and ends at the smallest final step count across all runs.
+Each seed's evaluations are linearly interpolated onto common agent environment
+steps before calculating means and seed spread. The range starts at zero and
+ends at the smallest final agent step count across all runs.
 There is no extrapolation. These are interpolated estimates, not fresh evaluations
 of models trained to exactly identical environment steps. If smoke runs have no
 shared range, the comparison CSV is empty and the plot explains why.

@@ -1,7 +1,6 @@
 """Four-frame CartPole observations and shared trajectory collection."""
 
 from collections import deque
-from time import perf_counter
 
 import gymnasium as gym
 import numpy as np
@@ -99,44 +98,65 @@ class HistoryStackWrapper(gym.Wrapper):
         return self._observe(state), reward, terminated, truncated, info
 
 
-def random_rollouts(settings, n_rollouts, seed, fixed_params=None):
-    """Collect a bunch of random rollouts from env.
+def random_rollouts(settings, count, seed, fixed_params=None, horizon=0):
+    """Collect random transitions or complete windows within episode boundaries.
 
     Args:
         settings: Environment config.
-        count: Number of transitions.
+        count: Number of transitions or windows.
         seed: Data collection seed.
         fixed_params: Optional evaluation parameter pair.
+        horizon: Future steps per window; zero keeps the one-step format.
 
     Returns:
-        CPU tensors and collection timing metadata.
+        CPU tensors.
     """
+    if count <= 0 or horizon < 0 or horizon >= settings["max_steps"]:
+        raise ValueError("Count must be positive and horizon below max_steps")
     env = HistoryStackWrapper(settings, images=True, fixed_params=fixed_params)
     rng = np.random.default_rng(seed)
     arrays = {
-        "vector": np.empty((n_rollouts, 4, 3), np.float32),
-        "image": np.empty((n_rollouts, 4, 64, 64), np.uint8),
-        "action": np.empty(n_rollouts, np.int64),
-        "next_vector": np.empty((n_rollouts, 3), np.float32),
-        "next_image": np.empty((n_rollouts, 64, 64), np.uint8),
+        "vector": np.empty((count, 4, 3), np.float32),
+        "image": np.empty((count, 4, 64, 64), np.uint8),
     }
-    start = perf_counter()
+    if horizon:
+        arrays["actions"] = np.empty((count, horizon), np.int64)
+        arrays["targets"] = np.empty((count, horizon + 1, 3), np.float32)
+    else:
+        arrays["action"] = np.empty(count, np.int64)
+        arrays["next_vector"] = np.empty((count, 3), np.float32)
+        arrays["next_image"] = np.empty((count, 64, 64), np.uint8)
     observation, _ = env.reset(seed=seed)
+    observations, actions = [observation], []
+    collected = 0
+    steps = max(1, horizon)
 
-    # Generate rollouts
+    # Slide each window forward without crossing an episode boundary.
     try:
-        for i in range(n_rollouts):
+        while collected < count:
             action = int(rng.integers(2))
             future, _, terminated, truncated, _ = env.step(action)
-            for key in ("vector", "image"):
-                arrays[key][i] = observation[key]
-                arrays[f"next_{key}"][i] = future[key][-1]
-            arrays["action"][i] = action
-            observation = future
-            if (terminated or truncated) and i + 1 < n_rollouts:
-                observation, _ = env.reset()
+            actions.append(action)
+            observations.append(future)
+            if len(actions) == steps:
+                arrays["vector"][collected] = observations[0]["vector"]
+                arrays["image"][collected] = observations[0]["image"]
+                if horizon:
+                    arrays["actions"][collected] = actions
+                    arrays["targets"][collected] = [
+                        item["vector"][-1] for item in observations
+                    ]
+                else:
+                    arrays["action"][collected] = action
+                    arrays["next_vector"][collected] = future["vector"][-1]
+                    arrays["next_image"][collected] = future["image"][-1]
+                collected += 1
+                observations.pop(0)
+                actions.pop(0)
+            if terminated or truncated:
+                if collected < count:
+                    observation, _ = env.reset()
+                    observations, actions = [observation], []
     finally:
         env.close()
-
-    metadata = {"collection_seconds": perf_counter() - start}
-    return {key: torch.from_numpy(value) for key, value in arrays.items()}, metadata
+    return {key: torch.from_numpy(value) for key, value in arrays.items()}

@@ -52,6 +52,7 @@
 - Evaluation
     - Use the following as evaluation metrics:
     - WM: L2 of each state variable separately. i.e one loss for cart position, one for cart velocity, and one for pole angle
+        - Evaluate up to the horizon EVAL_HORIZON = 4. e.g. evaluate the error directly reconstructing the state, error after one step on a uniformly sampled action with the dynamics latent, then again, all the way up to 4 dynamics steps. EVAL_HORIZON = 0 means no horizon evaluation, and only evaluation on the immediate step.
     - Agent: Episodic return
 
 - Training

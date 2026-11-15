@@ -37,7 +37,7 @@ PlaNet introduced an RSSM with both deterministic and stochastic transitions and
 
 Use the shared next observed vector as the first prediction target, with normalized mean squared error. Both arms then learn the same task. Providing the full simulator state, including hidden angular velocity, as a training label is privileged supervision and changes the experiment; reserve it for evaluation or a clearly named separate condition. A held-out probe can measure angular-velocity recovery without feeding its gradient back into the world model.
 
-Do not add image reconstruction only to the visual arm in the first comparison: that changes both input and training objective. An image-only arm can use the same vector labels, but must be described as supervised prediction of vector state from images rather than learning only from images.
+Do not add image reconstruction only to the visual arm in the first comparison: that changes both input and training objective. This experiment compares vector and combined inputs; both models produce vector predictions for evaluation.
 
 Measure prediction error at several horizons on the same held-out trajectories, plus PPO episode return on unseen parameter settings. If using the proposed observation predictor for longer predictions, explicitly feed predicted vectors back through the encoder; combined-input rollout requires a defined treatment of unavailable future images. Teacher-forced multi-step evaluation is not open-loop rollout accuracy.
 
