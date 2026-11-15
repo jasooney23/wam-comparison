@@ -7,21 +7,29 @@ cpu_threads = 1
 
 [environment]
 pole_mass = 0.1
-cart_mass = [1.0, 1.01]
-hinge_damping = [0.0, 0.0001]
 max_steps = 500
 
-[training]
-# Each arm trains for the same number of episodes.
-episodes = 1000
+[environment.ood]
+# Damping is entirely outside the training range.
+cart_mass = [0.25, 2.0]
+hinge_damping = [0.0025, 0.01]
+
+[pretrain]
 dataset = "outputs/visual-augmentation-simple/dataset.pt"
-pretrain_transitions = 10000
-pretrain_epochs = 100
+transitions = 10000
+epochs = 100
+eval_every = 5
 batch_size = 256
 world_lr = 0.0003
-policy_lr = 0.0003
 vector_weight = 1.0
 image_weight = 1.0
+
+[train]
+episodes = 1000
+policy_lr = 0.0003
+# Shared in-distribution ranges for dataset generation and agent training.
+cart_mass = [1.0, 1.01]
+hinge_damping = [0.0, 0.0001]
 
 [ppo]
 rollout_steps = 2048
@@ -30,14 +38,15 @@ epochs = 10
 gamma = 0.99
 gae_lambda = 0.95
 clip = 0.2
+max_grad_norm = 0.5
 value_weight = 0.5
 entropy_weight = 0.0
-max_grad_norm = 0.5
 
-[evaluation]
+[pretrain_eval]
+transitions = 500
+batch_size = 256
+
+[train_eval]
 interval = 100
-episodes = 10
-prediction_transitions = 256
+eval_episodes = 10
 horizon = 4
-# Every pair is outside the joint training parameter range.
-settings = [[1.0, 0.0025], [0.25, 0.0025], [2.0, 0.0025], [1.0, 0.01], [0.25, 0.01], [2.0, 0.01]]

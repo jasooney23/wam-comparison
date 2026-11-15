@@ -1,4 +1,4 @@
-"""Train paired CartPole agents and compare held-out results across training."""
+"""Train paired CartPole agents and evaluate on sampled OOD rollouts."""
 
 # General
 import argparse
@@ -6,7 +6,6 @@ import copy
 import csv
 import json
 import math
-import os
 import random
 import sys
 import tomllib
@@ -27,46 +26,102 @@ from torchrl.objectives.value import GAE
 # Keep the experiment executable despite its deliberately hyphenated directory.
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "outputs" / ".matplotlib"))
-from src.common.environments.history_stack_wrapper import (
-    HistoryStackWrapper,
-    random_rollouts,
-)
+from src.common.environments.history_stack_wrapper import HistoryStackWrapper
 from src.common.models.agent import Agent
 
-EXPERIMENT_VERSION = 9
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from experiment_config import environment_settings, validate_ranges
 
-STATE_NAMES = ("cart_position", "cart_velocity", "pole_angle")
-EVALUATION_METRICS = ("return_ood", *(f"{name}_l2_ood" for name in STATE_NAMES))
+EXPERIMENT_VERSION = 10
 
-
-def evaluation_metrics(horizon):
-    """List the return and vector errors recorded for a rollout horizon."""
-    if horizon == 0:
-        return EVALUATION_METRICS
-    return (
-        "return_ood",
-        *(
-            f"{name}_l2_h{step}_ood"
-            for name in STATE_NAMES
-            for step in range(horizon + 1)
-        ),
-    )
+TENSORBOARD_STATE_NAMES = ("cartPos", "cartVel", "poleAngle")
 
 
-def evaluation_metrics_from_rows(rows):
-    """Find the metric columns in an evaluation CSV row."""
-    keys = rows[0]
-    if "cart_position_l2_ood" in keys:
-        return EVALUATION_METRICS
-    horizons = [
-        int(key.rsplit("_h", 1)[1].split("_", 1)[0])
-        for key in keys
-        if key.startswith("cart_position_l2_h") and key.endswith("_ood")
-    ]
-    return evaluation_metrics(max(horizons))
+class MetricWriter:
+    """Write training scalars to TensorBoard and one CSV per run.
+
+    Args:
+        directory: Directory for this seed and modality.
+    """
+
+    def __init__(self, directory):
+        self.path = directory / "metrics.csv"
+        self.logdir = directory / "tensorboard"
+        self.writer = SummaryWriter(str(self.logdir))
+        self.rows = 0
+        if self.path.exists():
+            with self.path.open(newline="") as handle:
+                self.rows = sum(1 for _ in csv.DictReader(handle))
+
+    def add_csv(self, metric, value, step):
+        """Append a metric using its own phase's step counter.
+
+        Args:
+            metric: Metric tag, including its phase prefix.
+            value: Scalar metric value.
+            step: Epoch, episode, or optimizer update count.
+        """
+        exists = self.path.exists()
+        with self.path.open("a", newline="") as handle:
+            output = csv.writer(handle)
+            if not exists:
+                output.writerow(("metric", "step", "value"))
+            output.writerow((metric, step, float(value)))
+        self.rows += 1
+
+    def add_scalar(self, metric, value, step):
+        """Record the same scalar in TensorBoard and CSV.
+
+        Args:
+            metric: TensorBoard tag.
+            value: Scalar metric value.
+            step: Epoch, episode, or optimizer update count.
+        """
+        self.writer.add_scalar(metric, value, step)
+        self.add_csv(metric, value, step)
+
+    def restore(self, rows):
+        """Restore logs to the checkpoint, including their different step axes.
+
+        Args:
+            rows: Number of CSV rows saved in the checkpoint.
+
+        Raises:
+            ValueError: The CSV has fewer rows than the checkpoint requires.
+        """
+        records = []
+        if self.path.exists():
+            with self.path.open(newline="") as handle:
+                records = list(csv.DictReader(handle))
+        if len(records) < rows:
+            raise ValueError("The metrics CSV is missing checkpoint records")
+        records = records[:rows]
+        with self.path.open("w", newline="") as handle:
+            output = csv.DictWriter(handle, fieldnames=("metric", "step", "value"))
+            output.writeheader()
+            output.writerows(records)
+        # Rebuild event files from durable CSV rows to avoid stale resumed steps.
+        self.writer.close()
+        for path in self.logdir.glob("events.out.tfevents.*"):
+            path.unlink()
+        self.writer = SummaryWriter(str(self.logdir))
+        for row in records:
+            if row["metric"].startswith(("pretrain/wm/", "train/ppo/", "train/wm/")):
+                self.writer.add_scalar(
+                    row["metric"], float(row["value"]), int(row["step"])
+                )
+        self.rows = rows
+
+    def flush(self):
+        """Flush pending TensorBoard events; CSV rows are written immediately."""
+        self.writer.flush()
+
+    def close(self):
+        """Close TensorBoard event writing."""
+        self.writer.close()
 
 
+# ============= VALIDATION =============
 def validate(config):
     """Reject invalid ranges, weights, and training sizes early."""
     if not config["run"]["modalities"] or any(
@@ -89,15 +144,11 @@ def validate(config):
     positive = {
         "run": ["cpu_threads"],
         "environment": ["pole_mass", "max_steps"],
-        "training": [
-            "pretrain_transitions",
-            "pretrain_epochs",
-            "batch_size",
-            "world_lr",
-            "policy_lr",
-        ],
+        "pretrain": ["transitions", "epochs", "eval_every", "batch_size", "world_lr"],
+        "train": ["episodes", "policy_lr"],
+        "pretrain_eval": ["transitions", "batch_size"],
         "ppo": ["rollout_steps", "minibatch_size", "epochs", "max_grad_norm", "clip"],
-        "evaluation": ["interval", "episodes", "prediction_transitions"],
+        "train_eval": ["interval", "eval_episodes"],
     }
     for section, keys in positive.items():
         for key in keys:
@@ -111,17 +162,11 @@ def validate(config):
             ):
                 raise ValueError(f"{section}.{key} must be an integer")
 
-    if (
-        type(config["training"]["episodes"]) is not int
-        or config["training"]["episodes"] <= 0
-    ):
-        raise ValueError("training.episodes must be a positive integer")
-
     # Loss weights
     for key in ("vector_weight", "image_weight"):
-        value = config["training"][key]
+        value = config["pretrain"][key]
         if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"training.{key} must be finite and positive")
+            raise ValueError(f"pretrain.{key} must be finite and positive")
     for key in ("gamma", "gae_lambda"):
         if not 0 <= config["ppo"][key] <= 1:
             raise ValueError(f"ppo.{key} must be between zero and one")
@@ -130,42 +175,14 @@ def validate(config):
         if not math.isfinite(value) or value < 0:
             raise ValueError(f"ppo.{key} must be finite and nonnegative")
 
-    # Physics ranges
-    for key in ("cart_mass", "hinge_damping"):
-        bounds = config["environment"][key]
-        if (
-            len(bounds) != 2
-            or not all(math.isfinite(x) for x in bounds)
-            or bounds[0] > bounds[1]
-        ):
-            raise ValueError(f"Invalid environment.{key} range")
-        if bounds[0] < 0 or (key == "cart_mass" and bounds[0] == 0):
-            raise ValueError(f"Invalid environment.{key} range")
-    for pair in config["evaluation"]["settings"]:
-        if (
-            len(pair) != 2
-            or not all(math.isfinite(x) for x in pair)
-            or pair[0] <= 0
-            or pair[1] < 0
-        ):
-            raise ValueError(
-                "Evaluation settings require positive mass and nonnegative damping"
-            )
-        if all(
-            config["environment"][key][0] <= value <= config["environment"][key][1]
-            for key, value in zip(("cart_mass", "hinge_damping"), pair)
-        ):
-            raise ValueError(
-                "Evaluation settings must be outside the training parameter ranges"
-            )
-    if not config["evaluation"]["settings"]:
-        raise ValueError("At least one evaluation setting is required")
-    horizon = config["evaluation"]["horizon"]
+    # Shared ID and OOD ranges
+    validate_ranges(config)
+    horizon = config["train_eval"]["horizon"]
     if (
         type(horizon) is not int
         or not 0 <= horizon < config["environment"]["max_steps"]
     ):
-        raise ValueError("evaluation.horizon must be an integer below max_steps")
+        raise ValueError("train_eval.horizon must be an integer below max_steps")
 
 
 def smoke_config(config):
@@ -173,11 +190,10 @@ def smoke_config(config):
     config = copy.deepcopy(config)
     config["run"].update(seeds=[0])
     config["environment"]["max_steps"] = 30
-    config["training"].update(
-        episodes=2, pretrain_transitions=32, pretrain_epochs=1, batch_size=8
-    )
+    config["pretrain"].update(transitions=32, epochs=1, batch_size=8)
+    config["train"]["episodes"] = 2
     config["ppo"].update(rollout_steps=16, minibatch_size=8, epochs=1)
-    config["evaluation"].update(interval=1, episodes=1, prediction_transitions=8)
+    config["train_eval"].update(interval=1, eval_episodes=1)
     return config
 
 
@@ -199,6 +215,7 @@ def observation_batch(observation, device):
     return TensorDict(observation, batch_size=[], device=device).unsqueeze(0)
 
 
+# ============= AGENT TRAINING =============
 def ppo_modules(agent, settings):
     """Wrap shared networks in TorchRL's actor, critic, and PPO objective."""
     inputs = {"vector": "vector"}
@@ -237,6 +254,29 @@ def checked_step(loss, optimizer, parameters, max_norm):
     optimizer.step()
 
 
+@torch.no_grad()
+def reconstruction_mae(world, data, config, device):
+    """Measure current-state reconstruction MAE in physical units.
+
+    Args:
+        world: World model to evaluate.
+        data: Observation histories from a dataset or policy rollout.
+        config: Experiment configuration.
+        device: Model device.
+
+    Returns:
+        One mean absolute error per state variable.
+    """
+    totals = torch.zeros(3, device=device)
+    count = len(data["vector"])
+    for indices in torch.arange(count).split(config["pretrain_eval"]["batch_size"]):
+        batch = to_device(data, indices, device, world)
+        latent = world.encode(batch["vector"], batch.get("image"))
+        prediction = world.decode(latent)["vector"][:, -1] * world.std + world.mean
+        totals += (prediction - batch["vector"][:, -1]).abs().sum(0)
+    return dict(zip(TENSORBOARD_STATE_NAMES, (totals / count).tolist()))
+
+
 def pretrain(
     agent,
     data,
@@ -248,25 +288,25 @@ def pretrain(
     directory,
     seed,
     modality,
-    held_out,
+    test_data,
 ):
     """Train the full world model on the fixed synthesized dataset."""
-    settings = config["training"]
-    evaluations = []
+    settings = config["pretrain"]
     print(
         f"Pretraining world model: seed={seed} modality={modality}, "
-        f"{settings['pretrain_epochs']} epochs",
+        f"{settings['epochs']} epochs",
         flush=True,
     )
 
     # Train each epoch
-    for epoch in range(settings["pretrain_epochs"]):
+    for epoch in range(settings["epochs"]):
         start = perf_counter()
         order = torch.randperm(len(data["action"]))
         total = 0.0
+        components = {"reconstruction_loss": 0.0, "dynamics_loss": 0.0}
         for indices in order.split(settings["batch_size"]):
             batch = to_device(data, indices, device, agent.world)
-            loss, _ = agent.world.loss(
+            loss, losses = agent.world.loss(
                 batch, settings["vector_weight"], settings["image_weight"]
             )
             checked_step(
@@ -277,32 +317,42 @@ def pretrain(
             )
             counter["world_updates"] += 1
             total += loss.item() * len(indices)
+            for key in components:
+                components[key] += losses[key].item() * len(indices)
         if device.type == "cuda":
             torch.cuda.synchronize()
         counter["world_training_seconds"] += perf_counter() - start
-        writer.add_scalar("pretrain/loss", total / len(order), epoch + 1)
+        metrics = {
+            "loss_total": total / len(order),
+            "loss_rec": components["reconstruction_loss"] / len(order),
+            "loss_dyn": components["dynamics_loss"] / len(order),
+            "wall_time": counter["world_training_seconds"],
+            "grad_steps": counter["world_updates"],
+        }
+        evaluating = (epoch + 1) % settings["eval_every"] == 0 or epoch + 1 == settings[
+            "epochs"
+        ]
+        if evaluating:
+            for label, observations in (("train", data), ("test", test_data)):
+                metrics.update(
+                    {
+                        f"mae_{name}_{label}": value
+                        for name, value in reconstruction_mae(
+                            agent.world, observations, config, device
+                        ).items()
+                    }
+                )
+        for key, value in metrics.items():
+            writer.add_scalar(f"pretrain/wm/{key}", value, epoch + 1)
         print(
             f"World model seed={seed} {modality}: "
-            f"epoch {epoch + 1}/{settings['pretrain_epochs']}, "
+            f"epoch {epoch + 1}/{settings['epochs']}, "
             f"loss={total / len(order):.6f}, updates={counter['world_updates']:,}",
             flush=True,
         )
-        if (epoch + 1) % 20 == 0 or epoch + 1 == settings["pretrain_epochs"]:
-            metrics = evaluate_world(agent.world, held_out, config, device)
-            evaluations.append(
-                dict(
-                    epoch=epoch + 1,
-                    world_updates=counter["world_updates"],
-                    world_training_seconds=counter["world_training_seconds"],
-                    **metrics,
-                )
-            )
-            with (directory / "world-metrics.csv").open("w", newline="") as handle:
-                output = csv.DictWriter(handle, fieldnames=list(evaluations[0]))
-                output.writeheader()
-                output.writerows(evaluations)
-            for key, value in metrics.items():
-                writer.add_scalar(f"world_evaluation/{key}", value, epoch + 1)
+
+        # Save evaluated world models.
+        if evaluating:
             torch.save(
                 {
                     "experiment_version": EXPERIMENT_VERSION,
@@ -312,7 +362,7 @@ def pretrain(
                     "epoch": epoch + 1,
                     "world_updates": counter["world_updates"],
                     "world_training_seconds": counter["world_training_seconds"],
-                    "environment": config["environment"],
+                    "environment": environment_settings(config),
                 },
                 directory / f"world-epoch-{epoch + 1:03d}.pt",
             )
@@ -321,9 +371,9 @@ def pretrain(
 def rollout(agent, actor, critic, env, config, seed, episodes, device):
     """Collect policy data, finishing at an episode boundary for exact resume."""
     settings = config["ppo"]
-    target = config["training"]["episodes"]
-    next_evaluation = (episodes // config["evaluation"]["interval"] + 1) * config[
-        "evaluation"
+    target = config["train"]["episodes"]
+    next_evaluation = (episodes // config["train_eval"]["interval"] + 1) * config[
+        "train_eval"
     ]["interval"]
 
     # Rollout buffers
@@ -406,169 +456,119 @@ def update(agent, data, policy_optimizer, config, counter, device, ppo_loss):
 
 
 @torch.no_grad()
-def evaluate_world(world, held_out, config, device):
-    """Measure reconstruction and open-loop vector errors on shared OOD data.
+def evaluate(agent, actor, config, seed, device):
+    """Measure return and WM errors on the same sampled OOD policy episodes.
 
     Args:
-        world: World model to evaluate.
-        held_out: One fixed dataset for each OOD parameter setting.
+        agent: Agent with a frozen world model.
+        actor: Policy used to select evaluation actions.
         config: Experiment configuration.
-        device: Device used by the world model.
+        seed: Paired run seed.
+        device: Model device.
 
     Returns:
-        Per-variable scalar L2 errors for each setting and their uniform mean.
+        Episode return statistics and per-variable MAE at each horizon.
+        Each horizon uses every available window within episode boundaries.
     """
-    metrics = {}
-    horizon = config["evaluation"]["horizon"]
-    for number, data in enumerate(held_out):
-        totals = torch.zeros((horizon + 1, len(STATE_NAMES)), device=device)
-        count = 0
-        for indices in torch.arange(len(data["vector"])).split(
-            config["training"]["batch_size"]
-        ):
-            batch = to_device(data, indices, device, world)
-            latent = world.encode(batch["vector"], batch.get("image"))
-            for step in range(horizon + 1):
-                if step:
-                    latent = world.predict(latent, batch["actions"][:, step - 1])
-                prediction = world.decode(latent)["vector"][:, -1]
-                prediction = prediction * world.std + world.mean
-                target = (
-                    batch["targets"][:, step] if horizon else batch["vector"][:, -1]
-                )
-                totals[step] += (prediction - target).abs().sum(0)
-            count += len(indices)
-        for step, errors in enumerate(totals / count):
-            for name, error in zip(STATE_NAMES, errors):
-                suffix = f"_h{step}" if horizon else ""
-                metrics[f"{name}_l2{suffix}_heldout_{number}"] = error.item()
-
-    # Average the equally sized datasets across OOD settings.
-    for key in evaluation_metrics(horizon)[1:]:
-        prefix = key.removesuffix("_ood")
-        metrics[key] = float(
-            np.mean([metrics[f"{prefix}_heldout_{i}"] for i in range(len(held_out))])
-        )
-    return metrics
-
-
-def evaluate(agent, actor, held_out, config, seed, device):
-    """Measure OOD return and vector rollout errors without training."""
-    metrics = evaluate_world(agent.world, held_out, config, device)
-    with (
-        torch.no_grad(),
-        set_exploration_type(ExplorationType.MODE),
-    ):
-        for number, setting in enumerate(config["evaluation"]["settings"]):
-            label = f"heldout_{number}"
-            env = HistoryStackWrapper(
-                config["environment"],
-                images=agent.world.has_image,
-                fixed_params=setting,
-            )
-
-            # Evaluate control
-            scores = []
-            try:
-                for episode in range(config["evaluation"]["episodes"]):
-                    observation, _ = env.reset(seed=1_000_000 + seed * 1000 + episode)
-                    ended, score = False, 0.0
-                    while not ended:
-                        batch = observation_batch(observation, device)
-                        actor(batch)
-                        observation, reward, terminated, truncated, _ = env.step(
-                            batch["action"].item()
-                        )
-                        score += reward
-                        ended = terminated or truncated
-                    scores.append(score)
-            finally:
-                env.close()
-            metrics[f"return_{label}"] = float(np.mean(scores))
-            metrics[f"return_std_{label}"] = float(np.std(scores))
-
-    # Each OOD setting has the same number of control episodes.
-    metrics["return_ood"] = float(
-        np.mean([metrics[f"return_heldout_{i}"] for i in range(len(held_out))])
+    horizon = config["train_eval"]["horizon"]
+    totals = torch.zeros((horizon + 1, 3), device=device)
+    counts = torch.zeros(horizon + 1, device=device)
+    scores = []
+    env = HistoryStackWrapper(
+        environment_settings(config, ood=True), images=agent.world.has_image
     )
+    try:
+        with set_exploration_type(ExplorationType.MODE):
+            for episode in range(config["train_eval"]["eval_episodes"]):
+                observation, _ = env.reset(seed=1_000_000 + seed * 1000 + episode)
+                pending = []
+                ended, score = False, 0.0
+                while not ended:
+                    batch = observation_batch(observation, device)
+                    actor(batch)
+                    # Compare previous predictions to this real observation.
+                    pending.append((batch["latent"], 0))
+                    for latent, step in pending:
+                        prediction = agent.world.decode(latent)["vector"][:, -1]
+                        prediction = prediction * agent.world.std + agent.world.mean
+                        totals[step] += (
+                            (prediction - batch["vector"][:, -1]).abs().sum(0)
+                        )
+                        counts[step] += 1
+                    action = batch["action"]
+                    pending = [
+                        (agent.world.predict(latent, action), step + 1)
+                        for latent, step in pending
+                        if step < horizon
+                    ]
+                    observation, reward, terminated, truncated, _ = env.step(
+                        action.item()
+                    )
+                    score += reward
+                    ended = terminated or truncated
+                # Include the final observation, without crossing the reset.
+                target = torch.as_tensor(observation["vector"][-1], device=device)
+                for latent, step in pending:
+                    prediction = agent.world.decode(latent)["vector"][:, -1]
+                    totals[step] += (
+                        (prediction * agent.world.std + agent.world.mean - target)
+                        .abs()
+                        .sum(0)
+                    )
+                    counts[step] += 1
+                scores.append(score)
+    finally:
+        env.close()
+    metrics = {
+        "return_ood": float(np.mean(scores)),
+        "return_std_ood": float(np.std(scores)),
+    }
+    for step in range(horizon + 1):
+        for name, error in zip(
+            TENSORBOARD_STATE_NAMES, totals[step] / counts[step].clamp_min(1)
+        ):
+            # A short episode can leave a long horizon without any valid window.
+            metrics[f"mae_{name}_h{step}_ood"] = (
+                error.item() if counts[step] else float("nan")
+            )
+        metrics[f"windows_h{step}"] = counts[step].item()
     return metrics
 
 
 def shared_data(config, seed, directory, *, load_training=True):
-    """Load shared OOD data and, when needed, the fixed training dataset.
+    """Load the fixed ID/OOD pairs only when pretraining is requested.
 
     Args:
         config: Experiment configuration.
-        seed: Paired run seed.
-        directory: Directory containing the held-out data cache.
+        seed: Paired run seed, unused because the dataset is shared.
+        directory: Run directory, unused because no rollout cache is needed.
         load_training: Whether this run will pretrain a world model.
 
     Returns:
-        Held-out data and its signature, plus training data when requested.
+        ID training pairs and OOD pretraining evaluation pairs, or an empty dict.
+
+    Raises:
+        ValueError: Dataset physics or pair counts do not match the config.
     """
-    path = directory / "data.pt"
-    signature = {
-        "experiment_version": EXPERIMENT_VERSION,
-        "environment": config["environment"],
-        "evaluation": config["evaluation"],
-        "seed": seed,
+    if not load_training:
+        return {}
+    dataset = torch.load(
+        config["pretrain"]["dataset"], weights_only=False, map_location="cpu"
+    )
+    if dataset.get("environment") != environment_settings(config) or dataset.get(
+        "evaluation_environment"
+    ) != environment_settings(config, ood=True):
+        raise ValueError("Dataset environment changed; regenerate the ID/OOD dataset")
+    for key, section in (("training", "pretrain"), ("evaluation", "pretrain_eval")):
+        if (
+            key not in dataset
+            or len(dataset[key]["action"]) != config[section]["transitions"]
+        ):
+            raise ValueError(f"Dataset size does not match {section}.transitions")
+    return {
+        "training": dataset["training"],
+        "pretrain_evaluation": dataset["evaluation"],
     }
-
-    # Checkpoint-only runs already contain their normalization buffers.
-    training = {}
-    if load_training:
-        dataset_path = Path(config["training"]["dataset"])
-        dataset_stat = dataset_path.stat()
-        signature.update(
-            training_size=config["training"]["pretrain_transitions"],
-            dataset=str(dataset_path.resolve()),
-            dataset_size=dataset_stat.st_size,
-            dataset_modified=dataset_stat.st_mtime_ns,
-        )
-        dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
-        if dataset["environment"] != config["environment"]:
-            raise ValueError(
-                "Dataset environment does not match the training configuration"
-            )
-        data = dataset["training"]
-        if len(data["action"]) != config["training"]["pretrain_transitions"]:
-            raise ValueError(
-                "Dataset size does not match training.pretrain_transitions"
-            )
-        training["training"] = data
-
-    # Cache only held-out data; the training dataset is shared by all seeds.
-    if path.exists():
-        payload = torch.load(path, weights_only=False, map_location="cpu")
-        cached_signature = payload["signature"]
-        if not load_training:
-            cached_signature = {
-                key: value
-                for key, value in cached_signature.items()
-                if key in signature
-            }
-        if cached_signature != signature:
-            raise ValueError(
-                f"Data configuration changed; choose a new output directory: {path}"
-            )
-        return {**payload, **training}
-
-    held_out = [
-        random_rollouts(
-            config["environment"],
-            config["evaluation"]["prediction_transitions"],
-            2_000_000 + seed * 1000 + i,
-            fixed_params=setting,
-            horizon=config["evaluation"]["horizon"],
-        )
-        for i, setting in enumerate(config["evaluation"]["settings"])
-    ]
-    payload = {
-        "signature": signature,
-        "held_out": held_out,
-    }
-    torch.save(payload, path)
-    return {**payload, **training}
 
 
 def load_checkpoint(path):
@@ -596,6 +596,7 @@ def save_checkpoint(
     modality,
     episodes,
     agent_environment_steps,
+    metric_rows,
 ):
     """Atomically save training state at an episode boundary."""
     state = {
@@ -610,6 +611,7 @@ def save_checkpoint(
         "modality": modality,
         "episodes": episodes,
         "agent_environment_steps": agent_environment_steps,
+        "metric_rows": metric_rows,
         "torch_rng": torch.get_rng_state(),
         "numpy_rng": np.random.get_state(),
         "python_rng": random.getstate(),
@@ -622,205 +624,7 @@ def save_checkpoint(
     temporary.replace(path)
 
 
-def plot_run(directory):
-    """Plot raw scores, prediction errors, and training counts against episodes."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    with (directory / "metrics.csv").open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    x = [int(row["episode"]) for row in rows]
-    figure, axes = plt.subplots(5, 1, figsize=(9, 15), sharex=True)
-    for key in rows[0]:
-        if key.startswith("return_") and not key.startswith("return_std_"):
-            axes[0].plot(x, [float(row[key]) for row in rows], marker=".", label=key)
-        for axis, name in zip(axes[1:4], STATE_NAMES):
-            if key == f"{name}_l2_ood" or (
-                key.startswith(f"{name}_l2_h") and key.endswith("_ood")
-            ):
-                axis.plot(x, [float(row[key]) for row in rows], marker=".", label=key)
-    for key in ("agent_environment_steps", "world_updates", "agent_updates"):
-        axes[4].plot(x, [float(row[key]) for row in rows], marker=".", label=key)
-
-    # Label and save
-    for axis, label in zip(
-        axes,
-        (
-            "Mean evaluation return",
-            "Cart position L2",
-            "Cart velocity L2",
-            "Pole angle L2",
-            "Cumulative counts",
-        ),
-    ):
-        axis.set_ylabel(label)
-        axis.legend(fontsize="small")
-        axis.grid(alpha=0.3)
-    axes[4].set_xlabel("Completed PPO episodes")
-    figure.tight_layout()
-    figure.savefig(directory / "curves.png")
-    plt.close(figure)
-
-
-def match_compute(runs, budget="agent_environment_steps"):
-    """Interpolate metrics within all runs' shared compute range.
-
-    Args:
-        runs: Mapping from modality to lists of CSV row lists, one per seed.
-        budget: Increasing compute column used to align runs.
-
-    Returns:
-        Rows with metric means and seed spread at common compute values.
-        An empty list means the runs have no shared compute range yet.
-    """
-    series = [rows for seeds in runs.values() for rows in seeds]
-    if not series:
-        return []
-    lower = max(float(rows[0][budget]) for rows in series)
-    upper = min(float(rows[-1][budget]) for rows in series)
-    if lower > upper:
-        return []
-    grid = np.unique(
-        [
-            lower,
-            upper,
-            *(
-                float(row[budget])
-                for rows in series
-                for row in rows
-                if lower <= float(row[budget]) <= upper
-            ),
-        ]
-    )
-
-    # Interpolate each seed before taking means; never extrapolate a curve.
-    result = []
-    for modality, seeds in runs.items():
-        for metric in evaluation_metrics_from_rows(seeds[0]):
-            values = np.array(
-                [
-                    np.interp(
-                        grid,
-                        [float(row[budget]) for row in rows],
-                        [float(row[metric]) for row in rows],
-                    )
-                    for rows in seeds
-                ]
-            )
-            for cost, mean, spread in zip(grid, values.mean(0), values.std(0)):
-                result.append(
-                    {
-                        "modality": modality,
-                        "metric": metric,
-                        budget: cost,
-                        "mean": mean,
-                        "std": spread,
-                        "seeds": len(seeds),
-                        "method": "linear_interpolation",
-                    }
-                )
-    return result
-
-
-def plot_comparison(output, budget="agent_environment_steps"):
-    """Save OOD comparison curves at common steps or total training time.
-
-    Args:
-        output: Directory containing paired runs.
-        budget: Agent environment steps or total training seconds.
-    """
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    runs = {}
-    for modality in ("vector", "combined"):
-        for path in sorted(output.glob(f"seed-*/{modality}/metrics.csv")):
-            with path.open(newline="") as handle:
-                runs.setdefault(modality, []).append(list(csv.DictReader(handle)))
-    label = {
-        "agent_environment_steps": "Agent environment steps",
-        "total_training_seconds": "Total training seconds (world model + agent)",
-    }[budget]
-    filename = (
-        "comparison" if budget == "agent_environment_steps" else "comparison-time"
-    )
-    matched = match_compute(runs, budget)
-    with (output / f"{filename}.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "modality",
-                "metric",
-                budget,
-                "mean",
-                "std",
-                "seeds",
-                "method",
-            ],
-        )
-        writer.writeheader()
-        writer.writerows(matched)
-
-    figure, axes = plt.subplots(4, 1, figsize=(9, 13), sharex=True)
-    for modality in runs:
-        for metric in dict.fromkeys(
-            row["metric"] for row in matched if row["modality"] == modality
-        ):
-            axis = (
-                axes[0]
-                if metric == "return_ood"
-                else next(
-                    axes[index + 1]
-                    for index, name in enumerate(STATE_NAMES)
-                    if metric.startswith(f"{name}_l2")
-                )
-            )
-            rows = [
-                row
-                for row in matched
-                if row["modality"] == modality and row["metric"] == metric
-            ]
-            if not rows:
-                continue
-            x = np.array([row[budget] for row in rows])
-            mean = np.array([row["mean"] for row in rows])
-            spread = np.array([row["std"] for row in rows])
-            axis.plot(
-                x, mean, marker=".", label=f"{modality} {metric} (n={rows[0]['seeds']})"
-            )
-            axis.fill_between(x, mean - spread, mean + spread, alpha=0.15)
-    for axis, label in zip(
-        axes,
-        (
-            "Mean OOD return",
-            "OOD cart position L2",
-            "OOD cart velocity L2",
-            "OOD pole angle L2",
-        ),
-    ):
-        axis.set_ylabel(label)
-        if matched:
-            axis.legend()
-        else:
-            axis.text(
-                0.5,
-                0.5,
-                "No shared compute range yet",
-                ha="center",
-                transform=axis.transAxes,
-            )
-        axis.grid(alpha=0.3)
-    axes[-1].set_xlabel(f"{label} (interpolated within shared range)")
-    figure.tight_layout()
-    figure.savefig(output / f"{filename}.png")
-    plt.close(figure)
-
-
-def run_arm(
+def run_training(
     config,
     seed,
     modality,
@@ -852,9 +656,9 @@ def run_arm(
         )
 
     # Configure optimizers
-    training = config["training"]
+    training = config["train"]
     world_optimizer = torch.optim.Adam(
-        agent.world.parameters(), lr=training["world_lr"]
+        agent.world.parameters(), lr=config["pretrain"]["world_lr"]
     )
     policy_optimizer = torch.optim.Adam(
         list(agent.policy.parameters()) + list(agent.value.parameters()),
@@ -870,17 +674,18 @@ def run_arm(
     }
     episodes, agent_environment_steps = 0, 0
     env = HistoryStackWrapper(
-        config["environment"],
+        environment_settings(config),
         images=agent.world.has_image,
         gui=gui,
     )
-    writer = SummaryWriter(str(directory / "tensorboard"))
+    writer = MetricWriter(directory)
     try:
         if resume:
+            # Load & verify checkpoint
             state = load_checkpoint(resume)
             original, current = copy.deepcopy(state["config"]), copy.deepcopy(config)
-            original["training"].pop("episodes")
-            current["training"].pop("episodes")
+            original["train"].pop("episodes")
+            current["train"].pop("episodes")
             if (
                 original != current
                 or state["seed"] != seed
@@ -895,6 +700,7 @@ def run_arm(
             policy_optimizer.load_state_dict(state["policy_optimizer"])
             world_optimizer.load_state_dict(state["world_optimizer"])
             counter = state["counter"]
+            writer.restore(state["metric_rows"])
             episodes = state["episodes"]
             agent_environment_steps = state["agent_environment_steps"]
             torch.set_rng_state(state["torch_rng"])
@@ -904,20 +710,21 @@ def run_arm(
                 torch.cuda.set_rng_state_all(state["cuda_rng"])
         else:
             if world_checkpoint:
+                # Use saved pretrained WM
                 state = torch.load(
                     world_checkpoint, map_location="cpu", weights_only=False
                 )
-                # Version 8 has the same world-model architecture and loss.
                 if (
-                    state.get("experiment_version") not in {8, EXPERIMENT_VERSION}
+                    state.get("experiment_version") != EXPERIMENT_VERSION
                     or state.get("modality") != modality
-                    or state.get("environment") != config["environment"]
+                    or state.get("environment") != environment_settings(config)
                 ):
                     raise ValueError("World checkpoint is incompatible with this run")
                 agent.world.load_state_dict(state["world"])
                 counter["world_updates"] = state["world_updates"]
                 counter["world_training_seconds"] = state["world_training_seconds"]
             else:
+                # pretrain WM
                 pretrain(
                     agent,
                     data,
@@ -929,47 +736,25 @@ def run_arm(
                     directory,
                     seed,
                     modality,
-                    payload["held_out"],
+                    payload["pretrain_evaluation"],
                 )
 
         # Save run settings
         agent.world.requires_grad_(False)
         (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
-        csv_path = directory / "metrics.csv"
-        # Drop any rows written after the last durable checkpoint on resume.
-        if resume and csv_path.exists():
-            with csv_path.open(newline="") as handle:
-                reader = csv.DictReader(handle)
-                fields, rows = (
-                    reader.fieldnames,
-                    [row for row in reader if int(row["episode"]) <= episodes],
-                )
-            with csv_path.open("w", newline="") as handle:
-                output = csv.DictWriter(handle, fieldnames=fields)
-                output.writeheader()
-                output.writerows(rows)
 
-        def record(scores):
-            metrics = evaluate(agent, actor, payload["held_out"], config, seed, device)
-            row = dict(
-                episode=episodes,
-                agent_environment_steps=agent_environment_steps,
-                total_training_seconds=(
-                    counter["world_training_seconds"]
-                    + counter["agent_training_seconds"]
-                ),
+        def record():
+            """Record joint rollout evaluation and save a durable checkpoint."""
+            metrics = evaluate(agent, actor, config, seed, device)
+            for key, value in metrics.items():
+                writer.add_csv(f"eval/{key}", value, episodes)
+            for key, value in {
                 **counter,
-                training_return=float(np.mean(scores)) if scores else float("nan"),
-                **metrics,
-            )
-            exists = csv_path.exists()
-            with csv_path.open("a", newline="") as handle:
-                output = csv.DictWriter(handle, fieldnames=list(row))
-                if not exists:
-                    output.writeheader()
-                output.writerow(row)
-            for key, value in row.items():
-                writer.add_scalar(key, value, episodes)
+                "agent_environment_steps": agent_environment_steps,
+                "total_training_seconds": counter["world_training_seconds"]
+                + counter["agent_training_seconds"],
+            }.items():
+                writer.add_csv(f"compute/{key}", value, episodes)
             writer.flush()
             checkpoint = directory / f"episode-{episodes:06d}.pt"
             save_checkpoint(
@@ -983,6 +768,7 @@ def run_arm(
                 modality,
                 episodes,
                 agent_environment_steps,
+                writer.rows,
             )
             print(
                 f"seed={seed} {modality}: episode={episodes} "
@@ -991,7 +777,7 @@ def run_arm(
             )
 
         if resume is None:
-            record([])
+            record()
 
         # Train policy
         while episodes < training["episodes"]:
@@ -1012,12 +798,20 @@ def run_arm(
             if device.type == "cuda":
                 torch.cuda.synchronize()
             counter["agent_training_seconds"] += perf_counter() - start
+            for episode, score in enumerate(scores, episodes - len(scores) + 1):
+                writer.add_scalar("train/ppo/episode_return", score, episode)
+            # One observation evaluation per rollout update, indexed by gradient steps.
+            for name, value in reconstruction_mae(
+                agent.world, batch, config, device
+            ).items():
+                writer.add_scalar(
+                    f"train/wm/mae_{name}", value, counter["agent_updates"]
+                )
             if (
-                episodes % config["evaluation"]["interval"] == 0
+                episodes % config["train_eval"]["interval"] == 0
                 or episodes == training["episodes"]
             ):
-                record(scores)
-        plot_run(directory)
+                record()
     finally:
         writer.close()
         env.close()
@@ -1107,7 +901,7 @@ def main():
             )
 
         # Train!
-        run_arm(
+        run_training(
             config,
             seed,
             modality,
@@ -1117,9 +911,6 @@ def main():
             args.gui,
             args.world_checkpoint,
         )
-
-    plot_comparison(output)
-    plot_comparison(output, "total_training_seconds")
 
 
 if __name__ == "__main__":

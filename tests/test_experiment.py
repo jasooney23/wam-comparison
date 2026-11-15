@@ -39,7 +39,6 @@ def config(tmp_path):
         result = training.smoke_config(tomllib.load(handle))
     result["run"].update(device="cpu", output=str(tmp_path))
     result["environment"]["max_steps"] = 5
-    result["evaluation"]["settings"] = [[1.0, 0.0025]]
     return result
 
 
@@ -49,8 +48,8 @@ def test_synthesized_dataset_is_reproducible(config):
     )
     generator = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(generator)
-    first = generator.generate(config["environment"], 4, 17)
-    second = generator.generate(config["environment"], 4, 17)
+    first = generator.generate(training.environment_settings(config), 4, 17)
+    second = generator.generate(training.environment_settings(config), 4, 17)
     for key in first:
         torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
     assert first["image"].shape == (4, 4, 64, 64)
@@ -105,7 +104,7 @@ def test_damping_satisfies_coupled_equations():
 
 
 def test_history_resets_parameters_and_truncates(config):
-    env = HistoryStackWrapper(config["environment"], images=False)
+    env = HistoryStackWrapper(training.environment_settings(config), images=False)
     try:
         observation, info = env.reset(seed=5)
         assert env.observation_space.contains(observation)
@@ -114,9 +113,9 @@ def test_history_resets_parameters_and_truncates(config):
         )
         mass = env.unwrapped.masscart
         assert (
-            config["environment"]["cart_mass"][0]
+            training.environment_settings(config)["cart_mass"][0]
             <= mass
-            <= config["environment"]["cart_mass"][1]
+            <= training.environment_settings(config)["cart_mass"][1]
         )
         for _ in range(5):
             _, _, _terminated, truncated, _ = env.step(0)
@@ -131,8 +130,12 @@ def test_history_resets_parameters_and_truncates(config):
 
 
 def test_render_has_no_parameter_cues_and_preserves_angle(config):
-    a = HistoryStackWrapper(config["environment"], fixed_params=(0.25, 0.0))
-    b = HistoryStackWrapper(config["environment"], fixed_params=(2.0, 0.01))
+    a = HistoryStackWrapper(
+        training.environment_settings(config), fixed_params=(0.25, 0.0)
+    )
+    b = HistoryStackWrapper(
+        training.environment_settings(config), fixed_params=(2.0, 0.01)
+    )
     try:
         first, _ = a.reset(seed=0)
         second, _ = b.reset(seed=0)
@@ -216,7 +219,7 @@ def test_gae_bootstraps_truncations_without_reset_leakage():
 @pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_agent_updates_only_policy_parameters(config, modality):
     torch.manual_seed(0)
-    data = random_rollouts(config["environment"], 8, 0)
+    data = random_rollouts(training.environment_settings(config), 8, 0)
     agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
     with torch.no_grad():
@@ -244,20 +247,13 @@ def test_agent_updates_only_policy_parameters(config, modality):
 
 
 def test_resume_matches_uninterrupted_training(config, tmp_path):
-    data = random_rollouts(config["environment"], 16, 0)
-    held_out = random_rollouts(
-        config["environment"],
-        8,
-        20,
-        fixed_params=(1.0, 0.0025),
-        horizon=config["evaluation"]["horizon"],
-    )
-    payload = {"training": data, "held_out": [held_out]}
+    write_dataset(config, tmp_path)
+    payload = training.shared_data(config, 0, tmp_path)
     directory = tmp_path / "arm"
-    training.run_arm(config, 0, "vector", payload, directory)
+    training.run_training(config, 0, "vector", payload, directory)
     complete = torch.load(directory / "episode-000002.pt", weights_only=False)
     payload.pop("training")
-    training.run_arm(
+    training.run_training(
         config, 0, "vector", payload, directory, directory / "episode-000001.pt"
     )
     resumed = torch.load(directory / "episode-000002.pt", weights_only=False)
@@ -270,34 +266,25 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
     assert complete["counter"]["agent_training_seconds"] > 0
     assert resumed["counter"]["agent_training_seconds"] > 0
     assert complete["agent_environment_steps"] == resumed["agent_environment_steps"]
-    assert (directory / "curves.png").is_file()
     with (directory / "metrics.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert int(rows[0]["agent_environment_steps"]) == 0
-    assert float(rows[0]["agent_training_seconds"]) == 0
-    assert float(rows[0]["world_training_seconds"]) > 0
-    assert int(rows[-1]["agent_environment_steps"]) > 0
-    assert float(rows[-1]["agent_training_seconds"]) > 0
-    for row in rows:
-        assert float(row["total_training_seconds"]) == pytest.approx(
-            float(row["world_training_seconds"]) + float(row["agent_training_seconds"])
-        )
-    assert "transitions" not in rows[0]
-    assert "training_seconds" not in rows[0]
+    assert len(rows) == resumed["metric_rows"]
+    assert_tensorboard_matches_csv(directory)
+    assert not list(directory.glob("*.png"))
 
     # Reject checkpoints from the custom backend.
     complete.pop("ppo_backend")
     legacy = directory / "legacy.pt"
     torch.save(complete, legacy)
     with pytest.raises(ValueError, match="previous PPO backend"):
-        training.run_arm(config, 0, "vector", payload, directory, legacy)
+        training.run_training(config, 0, "vector", payload, directory, legacy)
 
 
 @pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_ppo_and_world_losses_have_separate_gradients(config, modality):
     agent = Agent(modality)
     actor, critic, ppo_loss = training.ppo_modules(agent, config["ppo"])
-    data = random_rollouts(config["environment"], 4, 0)
+    data = random_rollouts(training.environment_settings(config), 4, 0)
     data = training.to_device(data, torch.arange(4), "cpu", agent.world)
     with torch.no_grad():
         critic(actor(data))
@@ -327,10 +314,10 @@ def test_ppo_and_world_losses_have_separate_gradients(config, modality):
 
 def test_single_transition_rollout_bootstraps_time_limit(config):
     config["environment"]["max_steps"] = 1
-    config["training"]["episodes"] = 1
+    config["train"]["episodes"] = 1
     agent = Agent("vector")
     actor, critic, _ = training.ppo_modules(agent, config["ppo"])
-    env = HistoryStackWrapper(config["environment"], images=False)
+    env = HistoryStackWrapper(training.environment_settings(config), images=False)
     try:
         data, episodes, scores = training.rollout(
             agent, actor, critic, env, config, 0, 0, "cpu"
@@ -348,16 +335,22 @@ def test_single_transition_rollout_bootstraps_time_limit(config):
 
 
 def write_dataset(config, tmp_path):
-    data = random_rollouts(config["environment"], 32, 0)
+    data = random_rollouts(training.environment_settings(config), 32, 0)
     path = tmp_path / "dataset.pt"
     torch.save(
         {
-            "environment": config["environment"],
+            "environment": training.environment_settings(config),
             "training": data,
+            "evaluation": random_rollouts(
+                training.environment_settings(config, ood=True),
+                config["pretrain_eval"]["transitions"],
+                1,
+            ),
+            "evaluation_environment": training.environment_settings(config, ood=True),
         },
         path,
     )
-    config["training"]["dataset"] = str(path)
+    config["pretrain"]["dataset"] = str(path)
 
 
 def test_old_dataset_collection_field_is_ignored(config, tmp_path):
@@ -370,43 +363,35 @@ def test_old_dataset_collection_field_is_ignored(config, tmp_path):
     assert "collection" not in payload
 
 
-def test_cached_data_rejects_changed_physics(config, tmp_path):
+def test_dataset_rejects_changed_physics(config, tmp_path):
     write_dataset(config, tmp_path)
     training.shared_data(config, 0, tmp_path)
-    config["environment"]["cart_mass"] = [0.6, 1.4]
+    config["train"]["cart_mass"] = [0.6, 1.4]
     with pytest.raises(ValueError, match="Dataset environment"):
         training.shared_data(config, 0, tmp_path)
 
 
-@pytest.mark.parametrize("modality, version", [("vector", 8), ("combined", 9)])
+@pytest.mark.parametrize("modality", ["vector", "combined"])
 def test_checkpoint_only_training_needs_no_dataset(
-    config, tmp_path, monkeypatch, modality, version
+    config, tmp_path, monkeypatch, modality
 ):
     write_dataset(config, tmp_path)
     payload = training.shared_data(config, 0, tmp_path)
     source = tmp_path / "source"
-    training.run_arm(config, 0, modality, payload, source)
+    training.run_training(config, 0, modality, payload, source)
     checkpoint = source / "world-epoch-001.pt"
     saved = torch.load(checkpoint, weights_only=False)
-    saved["experiment_version"] = version
-    torch.save(saved, checkpoint)
 
-    # Both cached and freshly collected evaluation data work without training data.
-    config["training"]["dataset"] = str(tmp_path / "missing.pt")
-    cached = training.shared_data(config, 0, tmp_path, load_training=False)
-    fresh = tmp_path / "fresh"
-    fresh.mkdir()
-    payload = training.shared_data(config, 0, fresh, load_training=False)
-    assert "training" not in payload and "training" not in cached
-    for key, value in cached["held_out"][0].items():
-        torch.testing.assert_close(value, payload["held_out"][0][key])
+    config["pretrain"]["dataset"] = str(tmp_path / "missing.pt")
+    payload = training.shared_data(config, 0, tmp_path, load_training=False)
+    assert payload == {}
 
     def reject_pretraining(*args, **kwargs):
         raise AssertionError("Checkpoint-only training must not pretrain")
 
     monkeypatch.setattr(training, "pretrain", reject_pretraining)
     destination = tmp_path / "new-agent"
-    training.run_arm(
+    training.run_training(
         config, 1, modality, payload, destination, world_checkpoint=checkpoint
     )
     result = torch.load(destination / "episode-000002.pt", weights_only=False)
@@ -421,22 +406,40 @@ def test_checkpoint_only_training_needs_no_dataset(
     assert result["counter"]["agent_updates"] > 0
 
 
-def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
-    config["training"].update(pretrain_epochs=21, batch_size=4)
-    data = random_rollouts(config["environment"], 4, 0)
-    held_out = [
-        random_rollouts(
-            config["environment"],
-            2,
-            20,
-            fixed_params=config["evaluation"]["settings"][0],
-            horizon=4,
+def assert_tensorboard_matches_csv(directory):
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    events = EventAccumulator(
+        str(directory / "tensorboard"), size_guidance={"scalars": 0}
+    ).Reload()
+    with (directory / "metrics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    tags = {
+        row["metric"]
+        for row in rows
+        if row["metric"].startswith(("pretrain/wm/", "train/ppo/", "train/wm/"))
+    }
+    assert set(events.Tags()["scalars"]) == tags
+    for tag in tags:
+        records = [row for row in rows if row["metric"] == tag]
+        scalars = events.Scalars(tag)
+        assert [event.step for event in scalars] == [
+            int(row["step"]) for row in records
+        ]
+        assert [event.value for event in scalars] == pytest.approx(
+            [float(row["value"]) for row in records]
         )
-    ]
+
+
+def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
+    config["pretrain"].update(epochs=11, batch_size=4)
+    data = random_rollouts(training.environment_settings(config), 4, 0)
+    test = random_rollouts(training.environment_settings(config, ood=True), 2, 20)
     agent = Agent("vector")
     optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
     counter = {"world_updates": 0, "world_training_seconds": 0.0}
-    with training.SummaryWriter(str(tmp_path / "tensorboard")) as writer:
+    writer = training.MetricWriter(tmp_path)
+    try:
         training.pretrain(
             agent,
             data,
@@ -448,20 +451,28 @@ def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
             tmp_path,
             0,
             "vector",
-            held_out,
+            test,
         )
-    with (tmp_path / "world-metrics.csv").open(newline="") as handle:
+    finally:
+        writer.close()
+    with (tmp_path / "metrics.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert [int(row["epoch"]) for row in rows] == [20, 21]
-    for row in rows:
-        epoch = int(row["epoch"])
+    assert_tensorboard_matches_csv(tmp_path)
+    mae = [row for row in rows if row["metric"] == "pretrain/wm/mae_cartPos_test"]
+    assert [int(row["step"]) for row in mae] == [5, 10, 11]
+    assert len([row for row in rows if row["metric"] == "pretrain/wm/loss_total"]) == 11
+    for row in mae:
+        epoch = int(row["step"])
         state = torch.load(tmp_path / f"world-epoch-{epoch:03d}.pt", weights_only=False)
         agent.world.load_state_dict(state["world"])
-        expected = training.evaluate_world(agent.world, held_out, config, "cpu")
-        for key, value in expected.items():
-            assert float(row[key]) == pytest.approx(value)
-        assert int(row["world_updates"]) == state["world_updates"] == epoch
-        assert float(row["world_training_seconds"]) == state["world_training_seconds"]
+        expected = training.reconstruction_mae(agent.world, test, config, "cpu")
+        assert float(row["value"]) == pytest.approx(expected["cartPos"])
+        assert state["world_updates"] == epoch
+    assert [p.name for p in sorted(tmp_path.glob("world-epoch-*.pt"))] == [
+        "world-epoch-005.pt",
+        "world-epoch-010.pt",
+        "world-epoch-011.pt",
+    ]
 
 
 def test_losses_average_modalities_and_use_shifted_history():
@@ -492,7 +503,7 @@ def test_losses_average_modalities_and_use_shifted_history():
 
 def test_reconstruction_trains_encoder_and_decoder_without_dynamics(config):
     model = WorldModel("combined")
-    data = random_rollouts(config["environment"], 4, 0)
+    data = random_rollouts(training.environment_settings(config), 4, 0)
     _, metrics = model.loss(data)
     metrics["reconstruction_loss"].backward()
     assert all(p.grad is None for p in model.dynamics.parameters())
@@ -507,178 +518,87 @@ def test_reconstruction_trains_encoder_and_decoder_without_dynamics(config):
         )
 
 
-@pytest.mark.parametrize("pair", [[1.0, 0.0], [1.01, 0.0001]])
-def test_evaluation_rejects_training_parameters(config, pair):
-    config["evaluation"]["settings"] = [pair]
+@pytest.mark.parametrize("key", ["cart_mass", "hinge_damping"])
+def test_evaluation_rejects_training_parameters(config, key):
+    # Both dimensions must overlap before the boxes overlap.
+    config["environment"]["ood"] = {
+        name: config["train"][name][:] for name in ("cart_mass", "hinge_damping")
+    }
     with pytest.raises(ValueError, match="outside the training"):
         training.validate(config)
 
 
 @pytest.mark.parametrize("modality", ["vector", "combined"])
-def test_evaluation_is_repeatable_and_leaves_training_unchanged(
-    config, modality, monkeypatch
-):
-    config["evaluation"]["horizon"] = 0
+@pytest.mark.parametrize("horizon", [0, 4])
+def test_joint_evaluation_uses_policy_rollouts(config, modality, horizon, monkeypatch):
+    config["train_eval"]["horizon"] = horizon
     agent = Agent(modality)
     actor, _, _ = training.ppo_modules(agent, config["ppo"])
-    held_out = random_rollouts(
-        config["environment"], 5, 20, fixed_params=config["evaluation"]["settings"][0]
-    )
     before = {key: value.clone() for key, value in agent.state_dict().items()}
+    traces = []
 
-    def reject_dynamics(*args, **kwargs):
-        raise AssertionError("Horizon zero must not advance the dynamics")
+    class TracedEnvironment(HistoryStackWrapper):
+        def reset(self, **kwargs):
+            observation, info = super().reset(**kwargs)
+            traces.append({"observations": [observation], "actions": []})
+            assert (
+                config["environment"]["ood"]["hinge_damping"][0]
+                <= info["hinge_damping"]
+                <= config["environment"]["ood"]["hinge_damping"][1]
+            )
+            return observation, info
 
-    monkeypatch.setattr(agent.world, "predict", reject_dynamics)
-    metrics = training.evaluate(agent, actor, [held_out], config, 0, "cpu")
-    assert metrics == training.evaluate(agent, actor, [held_out], config, 0, "cpu")
+        def step(self, action):
+            result = super().step(action)
+            traces[-1]["observations"].append(result[0])
+            traces[-1]["actions"].append(action)
+            return result
+
+    monkeypatch.setattr(training, "HistoryStackWrapper", TracedEnvironment)
+    if horizon == 0:
+
+        def reject_dynamics(*args, **kwargs):
+            raise AssertionError("Horizon zero must not advance dynamics")
+
+        monkeypatch.setattr(agent.world, "predict", reject_dynamics)
+    metrics = training.evaluate(agent, actor, config, 0, "cpu")
+    trace = traces[0]
+    observations, actions = trace["observations"], trace["actions"]
+    assert metrics["return_ood"] == len(actions)
+    with torch.no_grad():
+        for step in range(horizon + 1):
+            errors = []
+            for start in range(min(len(actions), len(observations) - step)):
+                batch = training.observation_batch(observations[start], "cpu")
+                latent = agent.world.encode(batch["vector"], batch.get("image"))
+                for action in actions[start : start + step]:
+                    latent = agent.world.predict(latent, torch.tensor([action]))
+                prediction = (
+                    agent.world.decode(latent)["vector"][:, -1] * agent.world.std
+                    + agent.world.mean
+                )
+                errors.append(
+                    (
+                        prediction
+                        - torch.tensor(observations[start + step]["vector"][-1])
+                    ).abs()
+                )
+            assert metrics[f"windows_h{step}"] == len(errors)
+            for name, value in zip(
+                training.TENSORBOARD_STATE_NAMES, torch.cat(errors).mean(0)
+            ):
+                assert metrics[f"mae_{name}_h{step}_ood"] == pytest.approx(value.item())
+    assert metrics == training.evaluate(agent, actor, config, 0, "cpu")
     for key, value in agent.state_dict().items():
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
-    assert metrics["return_ood"] == 5
-    with torch.no_grad():
-        latent = agent.world.encode(held_out["vector"], held_out["image"])
-        prediction = agent.world.decode(latent)["vector"][:, -1]
-        expected = (
-            (
-                prediction * agent.world.std
-                + agent.world.mean
-                - held_out["vector"][:, -1]
-            )
-            .abs()
-            .mean(0)
-        )
-    for name, value in zip(training.STATE_NAMES, expected):
-        assert metrics[f"{name}_l2_ood"] == pytest.approx(value.item())
-    assert not any("loss" in key for key in metrics)
-    assert not any("familiar" in key for key in metrics)
-
-
-def test_horizon_windows_and_metrics(config):
-    config["evaluation"]["horizon"] = 4
-    data = random_rollouts(
-        config["environment"],
-        5,
-        20,
-        fixed_params=config["evaluation"]["settings"][0],
-        horizon=4,
-    )
-    assert data["actions"].shape == (5, 4)
-    assert data["targets"].shape == (5, 5, 3)
-    torch.testing.assert_close(data["targets"][:, 0], data["vector"][:, -1])
-
-    agent = Agent("vector")
-    actor, _, _ = training.ppo_modules(agent, config["ppo"])
-    metrics = training.evaluate(agent, actor, [data], config, 0, "cpu")
-    for step in range(5):
-        for name in training.STATE_NAMES:
-            assert f"{name}_l2_h{step}_ood" in metrics
-    with torch.no_grad():
-        latent = agent.world.encode(data["vector"])
-        for step in range(5):
-            if step:
-                latent = agent.world.predict(latent, data["actions"][:, step - 1])
-            prediction = agent.world.decode(latent)["vector"][:, -1]
-            expected = (
-                (
-                    prediction * agent.world.std
-                    + agent.world.mean
-                    - data["targets"][:, step]
-                )
-                .abs()
-                .mean(0)
-            )
-            for name, error in zip(training.STATE_NAMES, expected):
-                assert metrics[f"{name}_l2_h{step}_ood"] == pytest.approx(error.item())
-    assert not any("image" in key or "loss" in key for key in metrics)
-
-    # Horizon zero uses the same reconstruction as the start of a longer rollout.
-    config["evaluation"]["horizon"] = 0
-    immediate = training.evaluate_world(agent.world, [data], config, "cpu")
-    for name in training.STATE_NAMES:
-        assert immediate[f"{name}_l2_ood"] == metrics[f"{name}_l2_h0_ood"]
-
-
-@pytest.mark.parametrize(
-    "budget", ["agent_environment_steps", "total_training_seconds"]
-)
-def test_equal_compute_comparison_uses_only_shared_range(tmp_path, budget):
-    def rows(costs, returns):
-        return [
-            {
-                budget: cost,
-                "return_ood": score,
-                "cart_position_l2_ood": score / 10,
-                "cart_velocity_l2_ood": score / 5,
-                "pole_angle_l2_ood": score / 20,
-            }
-            for cost, score in zip(costs, returns)
-        ]
-
-    runs = {
-        "vector": [rows([10, 30, 110], [1, 3, 11]), rows([20, 40, 120], [3, 5, 13])],
-        "combined": [rows([50, 80, 130], [10, 16, 26])],
-    }
-    matched = training.match_compute(runs, budget)
-    assert min(row[budget] for row in matched) == 50
-    assert max(row[budget] for row in matched) == 110
-    vector = next(
-        row
-        for row in matched
-        if row["modality"] == "vector" and row["metric"] == "return_ood"
-    )
-    assert vector["mean"] == pytest.approx(5.5)
-    assert vector["std"] == pytest.approx(0.5)
-    assert vector["seeds"] == 2
-    assert (
-        training.match_compute(
-            {"vector": [rows([1, 2], [1, 2])], "combined": [rows([3, 4], [3, 4])]},
-            budget,
-        )
-        == []
-    )
-
-    # Exercise the nonempty CSV and plot path as well as the interpolation.
-    for modality, seeds in runs.items():
-        for seed, data in enumerate(seeds):
-            directory = tmp_path / f"seed-{seed}" / modality
-            directory.mkdir(parents=True)
-            with (directory / "metrics.csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(data[0]))
-                writer.writeheader()
-                writer.writerows(data)
-    training.plot_comparison(tmp_path, budget)
-    filename = (
-        "comparison" if budget == "agent_environment_steps" else "comparison-time"
-    )
-    with (tmp_path / f"{filename}.csv").open(newline="") as handle:
-        exported = list(csv.DictReader(handle))
-    assert len(exported) == len(matched)
-    assert all(row["method"] == "linear_interpolation" for row in exported)
-    assert (tmp_path / f"{filename}.png").is_file()
-
-
-def test_comparison_accepts_rollout_metrics(tmp_path):
-    for modality in ("vector", "combined"):
-        directory = tmp_path / "seed-0" / modality
-        directory.mkdir(parents=True)
-        row = {"agent_environment_steps": 10, "return_ood": 5}
-        row.update({key: 1.0 for key in training.evaluation_metrics(4)[1:]})
-        with (directory / "metrics.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(row))
-            writer.writeheader()
-            writer.writerow(row)
-    training.plot_comparison(tmp_path)
-    with (tmp_path / "comparison.csv").open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    assert {row["metric"] for row in rows} == set(training.evaluation_metrics(4))
 
 
 def test_old_experiment_artifacts_are_rejected(config, tmp_path):
     write_dataset(config, tmp_path)
-    payload = training.shared_data(config, 0, tmp_path)
-    payload["signature"].pop("experiment_version")
-    torch.save(payload, tmp_path / "data.pt")
-    with pytest.raises(ValueError, match="Data configuration changed"):
+    dataset = torch.load(config["pretrain"]["dataset"], weights_only=False)
+    dataset.pop("evaluation_environment")
+    torch.save(dataset, config["pretrain"]["dataset"])
+    with pytest.raises(ValueError, match="Dataset environment changed"):
         training.shared_data(config, 0, tmp_path)
     torch.save({"ppo_backend": "torchrl"}, tmp_path / "old.pt")
     with pytest.raises(ValueError, match="previous experiment definition"):

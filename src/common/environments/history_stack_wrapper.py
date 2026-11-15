@@ -98,12 +98,12 @@ class HistoryStackWrapper(gym.Wrapper):
         return self._observe(state), reward, terminated, truncated, info
 
 
-def random_rollouts(settings, count, seed, fixed_params=None, horizon=0):
-    """Collect random transitions or complete windows within episode boundaries.
+def random_rollouts(env_settings, count, seed, fixed_params=None, horizon=0):
+    """Collect a bunch of random transitions/windows from env.
 
     Args:
-        settings: Environment config.
-        count: Number of transitions or windows.
+        env_settings: Environment config.
+        count: Number of transitions/windows.
         seed: Data collection seed.
         fixed_params: Optional evaluation parameter pair.
         horizon: Future steps per window; zero keeps the one-step format.
@@ -111,9 +111,9 @@ def random_rollouts(settings, count, seed, fixed_params=None, horizon=0):
     Returns:
         CPU tensors.
     """
-    if count <= 0 or horizon < 0 or horizon >= settings["max_steps"]:
+    if count <= 0 or horizon < 0 or horizon >= env_settings["max_steps"]:
         raise ValueError("Count must be positive and horizon below max_steps")
-    env = HistoryStackWrapper(settings, images=True, fixed_params=fixed_params)
+    env = HistoryStackWrapper(env_settings, images=True, fixed_params=fixed_params)
     rng = np.random.default_rng(seed)
     arrays = {
         "vector": np.empty((count, 4, 3), np.float32),
@@ -131,7 +131,7 @@ def random_rollouts(settings, count, seed, fixed_params=None, horizon=0):
     collected = 0
     steps = max(1, horizon)
 
-    # Slide each window forward without crossing an episode boundary.
+    # collect rollouts
     try:
         while collected < count:
             action = int(rng.integers(2))
