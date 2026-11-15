@@ -28,7 +28,7 @@
     - Use a simple generic PPO policy, learning algorithm, hyperparameters etc.
         - Use generic, simple hyperparameters - the goal is not necessarily performance, but comparison of these two agents
     - WAM spec: 
-        - Start with a simple model that supports vector input, image input, and both at the same time
+        - Start with a simple model that supports vector input or vector + image input
         - Use encode -> dynamic predictor -> decode architecture
             - Encoder
                 - MLP for vector input

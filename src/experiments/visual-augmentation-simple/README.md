@@ -2,7 +2,8 @@
 
 Compare vector-only and vector-plus-image world models over three paired seeds.
 Each arm trains for `training.episodes` episodes. Comparisons align runs by
-cumulative environment steps over the range all arms cover.
+cumulative environment steps and total training time over the ranges all arms
+cover. The specification is [init-plan.md](init-plan.md).
 
 PPO uses TorchRL's `ProbabilisticActor`, `ClipPPOLoss`, and `GAE`. Rollouts and
 minibatches use TensorDict. A small Gymnasium loop retains exact episode limits
@@ -18,29 +19,39 @@ uv run python src/experiments/visual-augmentation-simple/generate_dataset.py
 uv run python src/experiments/visual-augmentation-simple/train.py
 ```
 
-The default dataset contains 100,000 samples. Each starts with a uniformly
+The default dataset contains 10,000 samples. Each starts with a uniformly
 sampled cart position and pole angle within the termination limits, and cart
 velocity and pole angular velocity in `[-2, 2]`. The generator samples physics
 parameters from the configured training ranges and simulates three random
 steps to produce a four-frame history, rejecting histories that terminate early.
 It samples a uniform random action and saves the resulting next frame. This
 synthetic distribution need not match the agent's experience. Generation is
-seeded and the image tensors require approximately 2 GB of storage.
+seeded and the image tensors require approximately 205 MB of storage.
 
 The world model trains for 100 passes over the fixed dataset. Checkpoints are
 saved every 20 epochs and at the final epoch. The agent then trains with that
-world model frozen. For a new agent using a saved world model, configure one
-seed and one modality and run:
+world model frozen. Each world-model checkpoint also gets an OOD prediction
+evaluation, saved in `world-metrics.csv` and TensorBoard. For a new agent using a
+saved world model, configure one seed and one modality and run:
 
 ```powershell
 uv run python src/experiments/visual-augmentation-simple/train.py --output outputs/new-agent --world-checkpoint outputs/visual-augmentation-simple/seed-0/vector/world-epoch-100.pt
 ```
+
+Agent-only runs and resumed runs use the saved normalization buffers and do not
+require the pretraining dataset. Held-out data is still collected or loaded for
+evaluation. The saved world-model training time and update count remain part of
+the new agent's compute accounting.
 
 Set `run.device = "cpu"` for CPU runs. Configure a different dataset path before
 generating a smoke dataset; pass `--smoke` to both scripts. Smoke runs use 32
 samples, one pretraining epoch and two agent episodes. Add `--gui` to display
 the environment during agent training. Use `--resume` with an episode checkpoint
 to resume an arm; only its episode limit may change. Load trusted checkpoints only.
+Experiment version 9 rejects older agent checkpoints and held-out caches because
+horizon-zero evaluation changed. Start a new output directory for this version.
+The fixed pretraining dataset and version 8 world-model checkpoints can be reused;
+the world-model architecture and training loss are unchanged.
 
 ## Observations and models
 
@@ -111,7 +122,9 @@ Defaults use 10 control episodes and 256 prediction windows per setting.
 successive latent dynamics steps. The same uniformly sampled action sequence is
 used for each modality. Windows stop at episode boundaries. At each step the
 model decodes its current latent state without encoding a new observation.
-Set `evaluation.horizon = 0` to measure only the immediate one-step prediction.
+Set `evaluation.horizon = 0` to measure only reconstruction of the current state,
+with no dynamics step. This is the same calculation as step zero of a longer
+evaluation rollout.
 
 Metrics include episodic return and separate state L2 errors for cart
 position, cart velocity, and pole angle for each setting (`heldout_N`) and their
@@ -129,7 +142,9 @@ not a controlled test of input information alone. Episode-return saturation at
 ## Compute measures
 
 Each run records separate wall-clock training seconds and optimizer updates for
-the world model and agent. `world_training_seconds` covers only pretraining
+the world model and agent. `total_training_seconds` is their sum, including the
+original pretraining cost when loading a world-model checkpoint.
+`world_training_seconds` covers only pretraining
 minibatch loops. `agent_training_seconds` covers policy rollout collection and
 PPO update loops. `agent_environment_steps` counts only policy rollout steps;
 the world model has no environment-step measure. Dataset collection, evaluation,
@@ -145,12 +160,14 @@ Under `run.output`:
 - `seed-N/data.pt`: held-out data and dataset settings.
 - `seed-N/MODALITY/config.json`: resolved settings.
 - `metrics.csv`: episode counts, scores, errors, separate training times and updates, and agent environment steps.
+- `world-metrics.csv`: OOD world-model errors, training time, and updates at each pretraining checkpoint.
 - `world-epoch-NNN.pt`: pretrained world-model checkpoints.
 - `episode-NNNNNN.pt`: resumable model and optimizer checkpoints, including update counts.
 - `curves.png`: all-setting scores, OOD state errors, and training counts against episodes.
 - `tensorboard/`: scalar event logs, including pretraining losses.
 - `comparison.png`: mean OOD return and state errors at common environment steps, with seed means ± one standard deviation.
 - `comparison.csv`: the matched values, environment steps, seed counts, and interpolation method.
+- `comparison-time.png` and `comparison-time.csv`: the same metrics matched by total world-model plus agent training seconds.
 
 ```powershell
 uv run tensorboard --logdir outputs/visual-augmentation-simple
@@ -162,6 +179,13 @@ ends at the smallest final agent step count across all runs.
 There is no extrapolation. These are interpolated estimates, not fresh evaluations
 of models trained to exactly identical environment steps. If smoke runs have no
 shared range, the comparison CSV is empty and the plot explains why.
+
+Time comparisons use the same method over the shared range of total training
+seconds. This range starts at the largest initial pretraining cost and ends at
+the smallest final total training cost. It may be empty, especially for smoke
+runs. These estimates support comparisons at common training costs; the runs
+still stop by episode count, not by an enforced wall-clock budget. Compare
+timings collected on the same hardware and device settings.
 
 Evaluation is recorded at the configured episode interval and at the final episode.
 

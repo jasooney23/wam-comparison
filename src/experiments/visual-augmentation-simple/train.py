@@ -34,7 +34,7 @@ from common.environments.history_stack_wrapper import (
 )
 from common.models import Agent
 
-EXPERIMENT_VERSION = 8
+EXPERIMENT_VERSION = 9
 
 STATE_NAMES = ("cart_position", "cart_velocity", "pole_angle")
 EVALUATION_METRICS = ("return_ood", *(f"{name}_l2_ood" for name in STATE_NAMES))
@@ -238,10 +238,21 @@ def checked_step(loss, optimizer, parameters, max_norm):
 
 
 def pretrain(
-    agent, data, optimizer, config, counter, writer, device, directory, seed, modality
+    agent,
+    data,
+    optimizer,
+    config,
+    counter,
+    writer,
+    device,
+    directory,
+    seed,
+    modality,
+    held_out,
 ):
     """Train the full world model on the fixed synthesized dataset."""
     settings = config["training"]
+    evaluations = []
     print(
         f"Pretraining world model: seed={seed} modality={modality}, "
         f"{settings['pretrain_epochs']} epochs",
@@ -277,6 +288,21 @@ def pretrain(
             flush=True,
         )
         if (epoch + 1) % 20 == 0 or epoch + 1 == settings["pretrain_epochs"]:
+            metrics = evaluate_world(agent.world, held_out, config, device)
+            evaluations.append(
+                dict(
+                    epoch=epoch + 1,
+                    world_updates=counter["world_updates"],
+                    world_training_seconds=counter["world_training_seconds"],
+                    **metrics,
+                )
+            )
+            with (directory / "world-metrics.csv").open("w", newline="") as handle:
+                output = csv.DictWriter(handle, fieldnames=list(evaluations[0]))
+                output.writeheader()
+                output.writerows(evaluations)
+            for key, value in metrics.items():
+                writer.add_scalar(f"world_evaluation/{key}", value, epoch + 1)
             torch.save(
                 {
                     "experiment_version": EXPERIMENT_VERSION,
@@ -379,10 +405,56 @@ def update(agent, data, policy_optimizer, config, counter, device, ppo_loss):
             counter["agent_updates"] += 1
 
 
-def evaluate(agent, actor, held_out, config, seed, device):
-    """Measure OOD return and vector rollout errors without training."""
+@torch.no_grad()
+def evaluate_world(world, held_out, config, device):
+    """Measure reconstruction and open-loop vector errors on shared OOD data.
+
+    Args:
+        world: World model to evaluate.
+        held_out: One fixed dataset for each OOD parameter setting.
+        config: Experiment configuration.
+        device: Device used by the world model.
+
+    Returns:
+        Per-variable scalar L2 errors for each setting and their uniform mean.
+    """
     metrics = {}
     horizon = config["evaluation"]["horizon"]
+    for number, data in enumerate(held_out):
+        totals = torch.zeros((horizon + 1, len(STATE_NAMES)), device=device)
+        count = 0
+        for indices in torch.arange(len(data["vector"])).split(
+            config["training"]["batch_size"]
+        ):
+            batch = to_device(data, indices, device, world)
+            latent = world.encode(batch["vector"], batch.get("image"))
+            for step in range(horizon + 1):
+                if step:
+                    latent = world.predict(latent, batch["actions"][:, step - 1])
+                prediction = world.decode(latent)["vector"][:, -1]
+                prediction = prediction * world.std + world.mean
+                target = (
+                    batch["targets"][:, step] if horizon else batch["vector"][:, -1]
+                )
+                totals[step] += (prediction - target).abs().sum(0)
+            count += len(indices)
+        for step, errors in enumerate(totals / count):
+            for name, error in zip(STATE_NAMES, errors):
+                suffix = f"_h{step}" if horizon else ""
+                metrics[f"{name}_l2{suffix}_heldout_{number}"] = error.item()
+
+    # Average the equally sized datasets across OOD settings.
+    for key in evaluation_metrics(horizon)[1:]:
+        prefix = key.removesuffix("_ood")
+        metrics[key] = float(
+            np.mean([metrics[f"{prefix}_heldout_{i}"] for i in range(len(held_out))])
+        )
+    return metrics
+
+
+def evaluate(agent, actor, held_out, config, seed, device):
+    """Measure OOD return and vector rollout errors without training."""
+    metrics = evaluate_world(agent.world, held_out, config, device)
     with (
         torch.no_grad(),
         set_exploration_type(ExplorationType.MODE),
@@ -415,89 +487,71 @@ def evaluate(agent, actor, held_out, config, seed, device):
             metrics[f"return_{label}"] = float(np.mean(scores))
             metrics[f"return_std_{label}"] = float(np.std(scores))
 
-            # Compare each predicted state variable in physical units.
-            totals = torch.zeros((max(1, horizon + 1), len(STATE_NAMES)), device=device)
-            count = 0
-            data = held_out[number]
-            for indices in torch.arange(len(data["vector"])).split(
-                config["training"]["batch_size"]
-            ):
-                batch = to_device(data, indices, device, agent.world)
-                latent = agent.world.encode(batch["vector"], batch.get("image"))
-                for step in range(horizon + 1):
-                    if step or horizon == 0:
-                        action = (
-                            batch["actions"][:, step - 1]
-                            if horizon
-                            else batch["action"]
-                        )
-                        latent = agent.world.predict(latent, action)
-                    prediction = agent.world.decode(latent)["vector"][:, -1]
-                    prediction = prediction * agent.world.std + agent.world.mean
-                    target = (
-                        batch["targets"][:, step] if horizon else batch["next_vector"]
-                    )
-                    totals[step] += (prediction - target).abs().sum(0)
-                count += len(indices)
-            for step, errors in enumerate(totals / count):
-                for name, error in zip(STATE_NAMES, errors):
-                    suffix = f"_h{step}" if horizon else ""
-                    metrics[f"{name}_l2{suffix}_{label}"] = error.item()
-
-    # Equal episode and dataset sizes make this a uniform average over OOD settings.
-    for key in (
-        "return",
-        *(
-            f"{name}_l2_h{step}" if horizon else f"{name}_l2"
-            for name in STATE_NAMES
-            for step in range(horizon + 1)
-        ),
-    ):
-        metrics[f"{key}_ood"] = float(
-            np.mean(
-                [
-                    metrics[f"{key}_heldout_{number}"]
-                    for number in range(len(config["evaluation"]["settings"]))
-                ]
-            )
-        )
+    # Each OOD setting has the same number of control episodes.
+    metrics["return_ood"] = float(
+        np.mean([metrics[f"return_heldout_{i}"] for i in range(len(held_out))])
+    )
     return metrics
 
 
-def shared_data(config, seed, directory):
-    """Collect or reload exactly shared data, rejecting incompatible caches."""
+def shared_data(config, seed, directory, *, load_training=True):
+    """Load shared OOD data and, when needed, the fixed training dataset.
+
+    Args:
+        config: Experiment configuration.
+        seed: Paired run seed.
+        directory: Directory containing the held-out data cache.
+        load_training: Whether this run will pretrain a world model.
+
+    Returns:
+        Held-out data and its signature, plus training data when requested.
+    """
     path = directory / "data.pt"
-    dataset_path = Path(config["training"]["dataset"])
-    dataset_stat = dataset_path.stat()
     signature = {
         "experiment_version": EXPERIMENT_VERSION,
         "environment": config["environment"],
-        "training_size": config["training"]["pretrain_transitions"],
         "evaluation": config["evaluation"],
         "seed": seed,
-        "dataset": str(dataset_path.resolve()),
-        "dataset_size": dataset_stat.st_size,
-        "dataset_modified": dataset_stat.st_mtime_ns,
     }
 
-    # Load the fixed synthesized training dataset.
-    dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
-    if dataset["environment"] != config["environment"]:
-        raise ValueError(
-            "Dataset environment does not match the training configuration"
+    # Checkpoint-only runs already contain their normalization buffers.
+    training = {}
+    if load_training:
+        dataset_path = Path(config["training"]["dataset"])
+        dataset_stat = dataset_path.stat()
+        signature.update(
+            training_size=config["training"]["pretrain_transitions"],
+            dataset=str(dataset_path.resolve()),
+            dataset_size=dataset_stat.st_size,
+            dataset_modified=dataset_stat.st_mtime_ns,
         )
-    data = dataset["training"]
-    if len(data["action"]) != config["training"]["pretrain_transitions"]:
-        raise ValueError("Dataset size does not match training.pretrain_transitions")
+        dataset = torch.load(dataset_path, weights_only=False, map_location="cpu")
+        if dataset["environment"] != config["environment"]:
+            raise ValueError(
+                "Dataset environment does not match the training configuration"
+            )
+        data = dataset["training"]
+        if len(data["action"]) != config["training"]["pretrain_transitions"]:
+            raise ValueError(
+                "Dataset size does not match training.pretrain_transitions"
+            )
+        training["training"] = data
 
     # Cache only held-out data; the training dataset is shared by all seeds.
     if path.exists():
         payload = torch.load(path, weights_only=False, map_location="cpu")
-        if payload["signature"] != signature:
+        cached_signature = payload["signature"]
+        if not load_training:
+            cached_signature = {
+                key: value
+                for key, value in cached_signature.items()
+                if key in signature
+            }
+        if cached_signature != signature:
             raise ValueError(
                 f"Data configuration changed; choose a new output directory: {path}"
             )
-        return {**payload, "training": data}
+        return {**payload, **training}
 
     held_out = [
         random_rollouts(
@@ -514,7 +568,7 @@ def shared_data(config, seed, directory):
         "held_out": held_out,
     }
     torch.save(payload, path)
-    return {**payload, "training": data}
+    return {**payload, **training}
 
 
 def load_checkpoint(path):
@@ -610,21 +664,22 @@ def plot_run(directory):
     plt.close(figure)
 
 
-def match_compute(runs):
-    """Interpolate metrics within all runs' shared agent-step range.
+def match_compute(runs, budget="agent_environment_steps"):
+    """Interpolate metrics within all runs' shared compute range.
 
     Args:
         runs: Mapping from modality to lists of CSV row lists, one per seed.
+        budget: Increasing compute column used to align runs.
 
     Returns:
-        Rows with metric means and seed spread at common agent step counts.
-        An empty list means the runs have no shared environment step range yet.
+        Rows with metric means and seed spread at common compute values.
+        An empty list means the runs have no shared compute range yet.
     """
     series = [rows for seeds in runs.values() for rows in seeds]
     if not series:
         return []
-    lower = max(float(rows[0]["agent_environment_steps"]) for rows in series)
-    upper = min(float(rows[-1]["agent_environment_steps"]) for rows in series)
+    lower = max(float(rows[0][budget]) for rows in series)
+    upper = min(float(rows[-1][budget]) for rows in series)
     if lower > upper:
         return []
     grid = np.unique(
@@ -632,10 +687,10 @@ def match_compute(runs):
             lower,
             upper,
             *(
-                float(row["agent_environment_steps"])
+                float(row[budget])
                 for rows in series
                 for row in rows
-                if lower <= float(row["agent_environment_steps"]) <= upper
+                if lower <= float(row[budget]) <= upper
             ),
         ]
     )
@@ -648,18 +703,18 @@ def match_compute(runs):
                 [
                     np.interp(
                         grid,
-                        [float(row["agent_environment_steps"]) for row in rows],
+                        [float(row[budget]) for row in rows],
                         [float(row[metric]) for row in rows],
                     )
                     for rows in seeds
                 ]
             )
-            for steps, mean, spread in zip(grid, values.mean(0), values.std(0)):
+            for cost, mean, spread in zip(grid, values.mean(0), values.std(0)):
                 result.append(
                     {
                         "modality": modality,
                         "metric": metric,
-                        "agent_environment_steps": steps,
+                        budget: cost,
                         "mean": mean,
                         "std": spread,
                         "seeds": len(seeds),
@@ -669,8 +724,13 @@ def match_compute(runs):
     return result
 
 
-def plot_comparison(output):
-    """Save OOD comparison curves at common agent environment steps."""
+def plot_comparison(output, budget="agent_environment_steps"):
+    """Save OOD comparison curves at common steps or total training time.
+
+    Args:
+        output: Directory containing paired runs.
+        budget: Agent environment steps or total training seconds.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -681,14 +741,21 @@ def plot_comparison(output):
         for path in sorted(output.glob(f"seed-*/{modality}/metrics.csv")):
             with path.open(newline="") as handle:
                 runs.setdefault(modality, []).append(list(csv.DictReader(handle)))
-    matched = match_compute(runs)
-    with (output / "comparison.csv").open("w", newline="") as handle:
+    label = {
+        "agent_environment_steps": "Agent environment steps",
+        "total_training_seconds": "Total training seconds (world model + agent)",
+    }[budget]
+    filename = (
+        "comparison" if budget == "agent_environment_steps" else "comparison-time"
+    )
+    matched = match_compute(runs, budget)
+    with (output / f"{filename}.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
                 "modality",
                 "metric",
-                "agent_environment_steps",
+                budget,
                 "mean",
                 "std",
                 "seeds",
@@ -719,7 +786,7 @@ def plot_comparison(output):
             ]
             if not rows:
                 continue
-            x = np.array([row["agent_environment_steps"] for row in rows])
+            x = np.array([row[budget] for row in rows])
             mean = np.array([row["mean"] for row in rows])
             spread = np.array([row["std"] for row in rows])
             axis.plot(
@@ -742,14 +809,14 @@ def plot_comparison(output):
             axis.text(
                 0.5,
                 0.5,
-                "No shared environment step range yet",
+                "No shared compute range yet",
                 ha="center",
                 transform=axis.transAxes,
             )
         axis.grid(alpha=0.3)
-    axes[-1].set_xlabel("Agent environment steps (interpolated within shared range)")
+    axes[-1].set_xlabel(f"{label} (interpolated within shared range)")
     figure.tight_layout()
-    figure.savefig(output / "comparison.png")
+    figure.savefig(output / f"{filename}.png")
     plt.close(figure)
 
 
@@ -777,11 +844,12 @@ def run_arm(
     device = torch.device(config["run"]["device"])
     agent = Agent(modality).to(device)
     actor, critic, ppo_loss = ppo_modules(agent, config["ppo"])
-    data = payload["training"]
-    agent.world.mean.copy_(data["next_vector"].mean(0).to(device))
-    agent.world.std.copy_(
-        data["next_vector"].std(0, unbiased=False).clamp_min(1e-6).to(device)
-    )
+    if not resume and not world_checkpoint:
+        data = payload["training"]
+        agent.world.mean.copy_(data["next_vector"].mean(0).to(device))
+        agent.world.std.copy_(
+            data["next_vector"].std(0, unbiased=False).clamp_min(1e-6).to(device)
+        )
 
     # Configure optimizers
     training = config["training"]
@@ -839,8 +907,9 @@ def run_arm(
                 state = torch.load(
                     world_checkpoint, map_location="cpu", weights_only=False
                 )
+                # Version 8 has the same world-model architecture and loss.
                 if (
-                    state.get("experiment_version") != EXPERIMENT_VERSION
+                    state.get("experiment_version") not in {8, EXPERIMENT_VERSION}
                     or state.get("modality") != modality
                     or state.get("environment") != config["environment"]
                 ):
@@ -860,6 +929,7 @@ def run_arm(
                     directory,
                     seed,
                     modality,
+                    payload["held_out"],
                 )
 
         # Save run settings
@@ -884,6 +954,10 @@ def run_arm(
             row = dict(
                 episode=episodes,
                 agent_environment_steps=agent_environment_steps,
+                total_training_seconds=(
+                    counter["world_training_seconds"]
+                    + counter["agent_training_seconds"]
+                ),
                 **counter,
                 training_return=float(np.mean(scores)) if scores else float("nan"),
                 **metrics,
@@ -1019,7 +1093,12 @@ def main():
         shared = output / f"seed-{seed}"
         shared.mkdir(parents=True, exist_ok=True)
         if seed != payload_seed:
-            payload = shared_data(config, seed, shared)
+            payload = shared_data(
+                config,
+                seed,
+                shared,
+                load_training=not (args.world_checkpoint or args.resume),
+            )
             payload_seed = seed
         directory = shared / modality
         if args.resume and args.resume.resolve().parent != directory.resolve():
@@ -1040,6 +1119,7 @@ def main():
         )
 
     plot_comparison(output)
+    plot_comparison(output, "total_training_seconds")
 
 
 if __name__ == "__main__":

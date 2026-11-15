@@ -2,7 +2,13 @@
 
 Research date: 2026-11-12. These are design recommendations, not tested results.
 
-## Recommendation
+These are historical research notes. [init-plan.md](init-plan.md) defines the
+implemented experiment: four-frame histories, a 16-unit latent, MLP dynamics,
+and vector/image reconstruction and prediction losses. The GRU recommendation
+and advice against image reconstruction below were not adopted. See
+[README.md](README.md) for the current implementation and commands.
+
+## Historical recommendation
 
 Start with a small observation encoder, a deterministic GRU memory, and an action-conditioned MLP prediction head. Use the same memory and prediction target for vector-only and vector-plus-image models. This is a simpler first experiment than a stochastic recurrent state-space model (RSSM). The World Models paper supports separating visual encoding, recurrent memory, and control; its actual model uses a VAE and a probabilistic recurrent predictor, so this proposal is a deliberate simplification. [World Models](https://worldmodels.github.io/)
 

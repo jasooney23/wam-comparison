@@ -18,7 +18,7 @@ from common.environments.history_stack_wrapper import (
     HistoryStackWrapper,
     random_rollouts,
 )
-from common.models import Agent, WorldModel
+from common.models import MLP, Agent, WorldModel
 
 EXPERIMENT = (
     Path(__file__).resolve().parents[1] / "src/experiments/visual-augmentation-simple"
@@ -181,6 +181,18 @@ def test_model_shapes_and_gradients(modality):
     )
 
 
+def test_mlp_default_and_explicit_linear_model():
+    model = MLP(3, 2)
+    layers = [layer for layer in model if isinstance(layer, nn.Linear)]
+    assert [(layer.in_features, layer.out_features) for layer in layers] == [
+        (3, 32),
+        (32, 2),
+    ]
+    linear = MLP(3, 2, [])
+    assert sum(isinstance(layer, nn.Linear) for layer in linear) == 1
+    assert linear(torch.zeros(4, 3)).shape == (4, 2)
+
+
 def test_gae_bootstraps_truncations_without_reset_leakage():
     data = TensorDict(
         {
@@ -242,6 +254,7 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
     directory = tmp_path / "arm"
     training.run_arm(config, 0, "vector", payload, directory)
     complete = torch.load(directory / "episode-000002.pt", weights_only=False)
+    payload.pop("training")
     training.run_arm(
         config, 0, "vector", payload, directory, directory / "episode-000001.pt"
     )
@@ -263,6 +276,10 @@ def test_resume_matches_uninterrupted_training(config, tmp_path):
     assert float(rows[0]["world_training_seconds"]) > 0
     assert int(rows[-1]["agent_environment_steps"]) > 0
     assert float(rows[-1]["agent_training_seconds"]) > 0
+    for row in rows:
+        assert float(row["total_training_seconds"]) == pytest.approx(
+            float(row["world_training_seconds"]) + float(row["agent_training_seconds"])
+        )
     assert "transitions" not in rows[0]
     assert "training_seconds" not in rows[0]
 
@@ -359,6 +376,92 @@ def test_cached_data_rejects_changed_physics(config, tmp_path):
         training.shared_data(config, 0, tmp_path)
 
 
+@pytest.mark.parametrize("modality, version", [("vector", 8), ("combined", 9)])
+def test_checkpoint_only_training_needs_no_dataset(
+    config, tmp_path, monkeypatch, modality, version
+):
+    write_dataset(config, tmp_path)
+    payload = training.shared_data(config, 0, tmp_path)
+    source = tmp_path / "source"
+    training.run_arm(config, 0, modality, payload, source)
+    checkpoint = source / "world-epoch-001.pt"
+    saved = torch.load(checkpoint, weights_only=False)
+    saved["experiment_version"] = version
+    torch.save(saved, checkpoint)
+
+    # Both cached and freshly collected evaluation data work without training data.
+    config["training"]["dataset"] = str(tmp_path / "missing.pt")
+    cached = training.shared_data(config, 0, tmp_path, load_training=False)
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    payload = training.shared_data(config, 0, fresh, load_training=False)
+    assert "training" not in payload and "training" not in cached
+    for key, value in cached["held_out"][0].items():
+        torch.testing.assert_close(value, payload["held_out"][0][key])
+
+    def reject_pretraining(*args, **kwargs):
+        raise AssertionError("Checkpoint-only training must not pretrain")
+
+    monkeypatch.setattr(training, "pretrain", reject_pretraining)
+    destination = tmp_path / "new-agent"
+    training.run_arm(
+        config, 1, modality, payload, destination, world_checkpoint=checkpoint
+    )
+    result = torch.load(destination / "episode-000002.pt", weights_only=False)
+    for key, value in saved["world"].items():
+        torch.testing.assert_close(
+            result["agent"][f"world.{key}"], value, rtol=0, atol=0
+        )
+    assert result["counter"]["world_updates"] == saved["world_updates"]
+    assert (
+        result["counter"]["world_training_seconds"] == saved["world_training_seconds"]
+    )
+    assert result["counter"]["agent_updates"] > 0
+
+
+def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
+    config["training"].update(pretrain_epochs=21, batch_size=4)
+    data = random_rollouts(config["environment"], 4, 0)
+    held_out = [
+        random_rollouts(
+            config["environment"],
+            2,
+            20,
+            fixed_params=config["evaluation"]["settings"][0],
+            horizon=4,
+        )
+    ]
+    agent = Agent("vector")
+    optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
+    counter = {"world_updates": 0, "world_training_seconds": 0.0}
+    with training.SummaryWriter(str(tmp_path / "tensorboard")) as writer:
+        training.pretrain(
+            agent,
+            data,
+            optimizer,
+            config,
+            counter,
+            writer,
+            torch.device("cpu"),
+            tmp_path,
+            0,
+            "vector",
+            held_out,
+        )
+    with (tmp_path / "world-metrics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [int(row["epoch"]) for row in rows] == [20, 21]
+    for row in rows:
+        epoch = int(row["epoch"])
+        state = torch.load(tmp_path / f"world-epoch-{epoch:03d}.pt", weights_only=False)
+        agent.world.load_state_dict(state["world"])
+        expected = training.evaluate_world(agent.world, held_out, config, "cpu")
+        for key, value in expected.items():
+            assert float(row[key]) == pytest.approx(value)
+        assert int(row["world_updates"]) == state["world_updates"] == epoch
+        assert float(row["world_training_seconds"]) == state["world_training_seconds"]
+
+
 def test_losses_average_modalities_and_use_shifted_history():
     model = WorldModel("combined")
     for parameter in model.parameters():
@@ -410,7 +513,9 @@ def test_evaluation_rejects_training_parameters(config, pair):
 
 
 @pytest.mark.parametrize("modality", ["vector", "combined"])
-def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality):
+def test_evaluation_is_repeatable_and_leaves_training_unchanged(
+    config, modality, monkeypatch
+):
     config["evaluation"]["horizon"] = 0
     agent = Agent(modality)
     actor, _, _ = training.ppo_modules(agent, config["ppo"])
@@ -418,6 +523,11 @@ def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality
         config["environment"], 5, 20, fixed_params=config["evaluation"]["settings"][0]
     )
     before = {key: value.clone() for key, value in agent.state_dict().items()}
+
+    def reject_dynamics(*args, **kwargs):
+        raise AssertionError("Horizon zero must not advance the dynamics")
+
+    monkeypatch.setattr(agent.world, "predict", reject_dynamics)
     metrics = training.evaluate(agent, actor, [held_out], config, 0, "cpu")
     assert metrics == training.evaluate(agent, actor, [held_out], config, 0, "cpu")
     for key, value in agent.state_dict().items():
@@ -425,11 +535,13 @@ def test_evaluation_is_repeatable_and_leaves_training_unchanged(config, modality
     assert metrics["return_ood"] == 5
     with torch.no_grad():
         latent = agent.world.encode(held_out["vector"], held_out["image"])
-        prediction = agent.world.decode(
-            agent.world.predict(latent, held_out["action"])
-        )["vector"][:, -1]
+        prediction = agent.world.decode(latent)["vector"][:, -1]
         expected = (
-            (prediction * agent.world.std + agent.world.mean - held_out["next_vector"])
+            (
+                prediction * agent.world.std
+                + agent.world.mean
+                - held_out["vector"][:, -1]
+            )
             .abs()
             .mean(0)
         )
@@ -477,12 +589,21 @@ def test_horizon_windows_and_metrics(config):
                 assert metrics[f"{name}_l2_h{step}_ood"] == pytest.approx(error.item())
     assert not any("image" in key or "loss" in key for key in metrics)
 
+    # Horizon zero uses the same reconstruction as the start of a longer rollout.
+    config["evaluation"]["horizon"] = 0
+    immediate = training.evaluate_world(agent.world, [data], config, "cpu")
+    for name in training.STATE_NAMES:
+        assert immediate[f"{name}_l2_ood"] == metrics[f"{name}_l2_h0_ood"]
 
-def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
+
+@pytest.mark.parametrize(
+    "budget", ["agent_environment_steps", "total_training_seconds"]
+)
+def test_equal_compute_comparison_uses_only_shared_range(tmp_path, budget):
     def rows(costs, returns):
         return [
             {
-                "agent_environment_steps": cost,
+                budget: cost,
                 "return_ood": score,
                 "cart_position_l2_ood": score / 10,
                 "cart_velocity_l2_ood": score / 5,
@@ -495,9 +616,9 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
         "vector": [rows([10, 30, 110], [1, 3, 11]), rows([20, 40, 120], [3, 5, 13])],
         "combined": [rows([50, 80, 130], [10, 16, 26])],
     }
-    matched = training.match_compute(runs)
-    assert min(row["agent_environment_steps"] for row in matched) == 50
-    assert max(row["agent_environment_steps"] for row in matched) == 110
+    matched = training.match_compute(runs, budget)
+    assert min(row[budget] for row in matched) == 50
+    assert max(row[budget] for row in matched) == 110
     vector = next(
         row
         for row in matched
@@ -508,7 +629,8 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
     assert vector["seeds"] == 2
     assert (
         training.match_compute(
-            {"vector": [rows([1, 2], [1, 2])], "combined": [rows([3, 4], [3, 4])]}
+            {"vector": [rows([1, 2], [1, 2])], "combined": [rows([3, 4], [3, 4])]},
+            budget,
         )
         == []
     )
@@ -522,12 +644,15 @@ def test_equal_compute_comparison_uses_only_shared_range(tmp_path):
                 writer = csv.DictWriter(handle, fieldnames=list(data[0]))
                 writer.writeheader()
                 writer.writerows(data)
-    training.plot_comparison(tmp_path)
-    with (tmp_path / "comparison.csv").open(newline="") as handle:
+    training.plot_comparison(tmp_path, budget)
+    filename = (
+        "comparison" if budget == "agent_environment_steps" else "comparison-time"
+    )
+    with (tmp_path / f"{filename}.csv").open(newline="") as handle:
         exported = list(csv.DictReader(handle))
     assert len(exported) == len(matched)
     assert all(row["method"] == "linear_interpolation" for row in exported)
-    assert (tmp_path / "comparison.png").is_file()
+    assert (tmp_path / f"{filename}.png").is_file()
 
 
 def test_comparison_accepts_rollout_metrics(tmp_path):
