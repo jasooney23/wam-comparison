@@ -28,11 +28,11 @@ from torchrl.objectives.value import GAE
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "outputs" / ".matplotlib"))
-from common.environments.history_stack_wrapper import (
+from src.common.environments.history_stack_wrapper import (
     HistoryStackWrapper,
     random_rollouts,
 )
-from common.models import Agent
+from src.common.models.agent import Agent
 
 EXPERIMENT_VERSION = 9
 

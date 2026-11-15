@@ -13,12 +13,14 @@ from tensordict import TensorDict
 from torch import nn
 from torchrl.objectives.value import GAE
 
-from common.environments.cartpole import CartPoleEnv
-from common.environments.history_stack_wrapper import (
+from src.common.environments.cartpole import CartPoleEnv
+from src.common.environments.history_stack_wrapper import (
     HistoryStackWrapper,
     random_rollouts,
 )
-from common.models import MLP, Agent, WorldModel
+from src.common.models.agent import Agent
+from src.common.models.common.basic import MLP
+from src.common.models.world_model import WorldModel
 
 EXPERIMENT = (
     Path(__file__).resolve().parents[1] / "src/experiments/visual-augmentation-simple"

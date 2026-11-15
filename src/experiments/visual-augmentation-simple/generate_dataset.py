@@ -11,7 +11,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
-from common.environments.history_stack_wrapper import HistoryStackWrapper
+from src.common.environments.history_stack_wrapper import HistoryStackWrapper
 
 
 def generate(settings, count, seed):

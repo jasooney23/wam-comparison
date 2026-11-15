@@ -99,7 +99,7 @@ advantage normalization.
 
 ## Physics and evaluation
 
-The local copy in `common/environments/cartpole/` preserves upstream licensing.
+The local copy in `src/common/environments/cartpole/` preserves upstream licensing.
 It adds validated cart/pole masses and viscous hinge torque
 `-hinge_damping * angular_velocity` to the coupled equations. It never edits the
 installed Gymnasium source. See its `NOTICE.md` for the equations.
