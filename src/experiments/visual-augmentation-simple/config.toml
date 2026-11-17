@@ -1,8 +1,6 @@
 [run]
 output = "outputs/visual-augmentation-simple"
 device = "cuda"
-seeds = [0, 1, 2]
-modalities = ["vector", "combined"]
 cpu_threads = 1
 
 [environment]
@@ -10,26 +8,29 @@ pole_mass = 0.1
 max_steps = 500
 
 [environment.ood]
-# Damping is entirely outside the training range.
-cart_mass = [0.25, 2.0]
-hinge_damping = [0.0025, 0.01]
+# Each parameter excludes its training interval when sampling OOD physics.
+cart_mass = [0.25, 1.5]
+hinge_damping = [0.001, 0.03]
 
 [pretrain]
+seeds = [0, 1, 2]
+max_grad_norm = 1.0
 dataset = "outputs/visual-augmentation-simple/dataset.pt"
 transitions = 10000
 epochs = 100
 eval_every = 5
-batch_size = 256
+batch_size = 64
 world_lr = 0.0003
 vector_weight = 1.0
 image_weight = 1.0
 
 [train]
+seeds = [0, 1, 2]
 episodes = 1000
 policy_lr = 0.0003
 # Shared in-distribution ranges for dataset generation and agent training.
-cart_mass = [1.0, 1.01]
-hinge_damping = [0.0, 0.0001]
+cart_mass = [0.5, 1]
+hinge_damping = [0.003, 0.01]
 
 [ppo]
 rollout_steps = 2048
@@ -38,13 +39,13 @@ epochs = 10
 gamma = 0.99
 gae_lambda = 0.95
 clip = 0.2
-max_grad_norm = 0.5
+max_grad_norm = 1.0
 value_weight = 0.5
 entropy_weight = 0.0
 
 [pretrain_eval]
 transitions = 500
-batch_size = 256
+batch_size = 64
 
 [train_eval]
 interval = 100

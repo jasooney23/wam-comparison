@@ -11,7 +11,7 @@ class MLP(nn.Sequential):
     Args:
         inputs: Input feature count.
         outputs: Output feature count.
-        hidden_layers: Hidden layer sizes; defaults to one layer of 32.
+        hidden_layers: Hidden layer sizes; defaults to no hidden layers.
         hidden_act_fn: Activation module class for hidden layers.
         output_act_fn: Activation module class for the output.
     """

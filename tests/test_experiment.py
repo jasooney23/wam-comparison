@@ -1,7 +1,9 @@
-"""Behavior checks for physics, training, measurement, and resume."""
+"""Behavior checks for physics, paired training stages, and measurement."""
 
 import csv
+import importlib
 import importlib.util
+import sys
 import tomllib
 from pathlib import Path
 
@@ -25,20 +27,21 @@ from src.common.models.world_model import WorldModel
 EXPERIMENT = (
     Path(__file__).resolve().parents[1] / "src/experiments/visual-augmentation-simple"
 )
-SPEC = importlib.util.spec_from_file_location(
-    "visual_training", EXPERIMENT / "train.py"
-)
-training = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(training)
+sys.path.insert(0, str(EXPERIMENT))
+training = importlib.import_module("train_agent")
+pretraining = importlib.import_module("pretrain_world_model")
+settings = importlib.import_module("experiment_config")
+
 torch.set_num_threads(1)
 
 
 @pytest.fixture
 def config(tmp_path):
     with (EXPERIMENT / "config.toml").open("rb") as handle:
-        result = training.smoke_config(tomllib.load(handle))
+        result = settings.smoke_config(tomllib.load(handle))
     result["run"].update(device="cpu", output=str(tmp_path))
     result["environment"]["max_steps"] = 5
+    result["pretrain_eval"]["transitions"] = 8
     return result
 
 
@@ -186,16 +189,17 @@ def test_model_shapes_and_gradients(modality):
     )
 
 
-def test_mlp_default_and_explicit_linear_model():
-    model = MLP(3, 2)
+def test_mlp_explicit_hidden_layers_and_default_linear_model():
+    model = MLP(3, 2, [32])
     layers = [layer for layer in model if isinstance(layer, nn.Linear)]
     assert [(layer.in_features, layer.out_features) for layer in layers] == [
         (3, 32),
         (32, 2),
     ]
-    linear = MLP(3, 2, [])
-    assert sum(isinstance(layer, nn.Linear) for layer in linear) == 1
-    assert linear(torch.zeros(4, 3)).shape == (4, 2)
+    for hidden_layers in (None, []):
+        linear = MLP(3, 2, hidden_layers)
+        assert sum(isinstance(layer, nn.Linear) for layer in linear) == 1
+        assert linear(torch.zeros(4, 3)).shape == (4, 2)
 
 
 def test_gae_bootstraps_truncations_without_reset_leakage():
@@ -244,40 +248,6 @@ def test_agent_updates_only_policy_parameters(config, modality):
     )
     assert counter["agent_updates"] > 0
     assert counter["world_updates"] == 0
-
-
-def test_resume_matches_uninterrupted_training(config, tmp_path):
-    write_dataset(config, tmp_path)
-    payload = training.shared_data(config, 0, tmp_path)
-    directory = tmp_path / "arm"
-    training.run_training(config, 0, "vector", payload, directory)
-    complete = torch.load(directory / "episode-000002.pt", weights_only=False)
-    payload.pop("training")
-    training.run_training(
-        config, 0, "vector", payload, directory, directory / "episode-000001.pt"
-    )
-    resumed = torch.load(directory / "episode-000002.pt", weights_only=False)
-    for key in complete["agent"]:
-        torch.testing.assert_close(
-            complete["agent"][key], resumed["agent"][key], rtol=0, atol=0
-        )
-    for key in ("world_updates", "agent_updates", "world_training_seconds"):
-        assert complete["counter"][key] == resumed["counter"][key]
-    assert complete["counter"]["agent_training_seconds"] > 0
-    assert resumed["counter"]["agent_training_seconds"] > 0
-    assert complete["agent_environment_steps"] == resumed["agent_environment_steps"]
-    with (directory / "metrics.csv").open(newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    assert len(rows) == resumed["metric_rows"]
-    assert_tensorboard_matches_csv(directory)
-    assert not list(directory.glob("*.png"))
-
-    # Reject checkpoints from the custom backend.
-    complete.pop("ppo_backend")
-    legacy = directory / "legacy.pt"
-    torch.save(complete, legacy)
-    with pytest.raises(ValueError, match="previous PPO backend"):
-        training.run_training(config, 0, "vector", payload, directory, legacy)
 
 
 @pytest.mark.parametrize("modality", ["vector", "combined"])
@@ -353,57 +323,165 @@ def write_dataset(config, tmp_path):
     config["pretrain"]["dataset"] = str(path)
 
 
-def test_old_dataset_collection_field_is_ignored(config, tmp_path):
-    write_dataset(config, tmp_path)
-    path = tmp_path / "dataset.pt"
-    dataset = torch.load(path, weights_only=False)
-    dataset["collection"] = {"collection_seconds": 123.0}
-    torch.save(dataset, path)
-    payload = training.shared_data(config, 0, tmp_path)
-    assert "collection" not in payload
-
-
 def test_dataset_rejects_changed_physics(config, tmp_path):
     write_dataset(config, tmp_path)
-    training.shared_data(config, 0, tmp_path)
+    pretraining.load_dataset(config)
     config["train"]["cart_mass"] = [0.6, 1.4]
     with pytest.raises(ValueError, match="Dataset environment"):
-        training.shared_data(config, 0, tmp_path)
+        pretraining.load_dataset(config)
 
 
-@pytest.mark.parametrize("modality", ["vector", "combined"])
-def test_checkpoint_only_training_needs_no_dataset(
-    config, tmp_path, monkeypatch, modality
-):
+@pytest.fixture
+def world_pairs(config, tmp_path):
     write_dataset(config, tmp_path)
-    payload = training.shared_data(config, 0, tmp_path)
-    source = tmp_path / "source"
-    training.run_training(config, 0, modality, payload, source)
-    checkpoint = source / "world-epoch-001.pt"
-    saved = torch.load(checkpoint, weights_only=False)
-
-    config["pretrain"]["dataset"] = str(tmp_path / "missing.pt")
-    payload = training.shared_data(config, 0, tmp_path, load_training=False)
-    assert payload == {}
-
-    def reject_pretraining(*args, **kwargs):
-        raise AssertionError("Checkpoint-only training must not pretrain")
-
-    monkeypatch.setattr(training, "pretrain", reject_pretraining)
-    destination = tmp_path / "new-agent"
-    training.run_training(
-        config, 1, modality, payload, destination, world_checkpoint=checkpoint
-    )
-    result = torch.load(destination / "episode-000002.pt", weights_only=False)
-    for key, value in saved["world"].items():
-        torch.testing.assert_close(
-            result["agent"][f"world.{key}"], value, rtol=0, atol=0
+    payload = pretraining.load_dataset(config)
+    source = tmp_path / "world-models"
+    for modality in training.MODALITIES:
+        pretraining.run_pretraining(
+            config, 0, modality, payload, training.run_directory(source, 0, modality)
         )
-    assert result["counter"]["world_updates"] == saved["world_updates"]
-    assert (
-        result["counter"]["world_training_seconds"] == saved["world_training_seconds"]
+    return source
+
+
+def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
+    Path(config["pretrain"]["dataset"]).unlink()
+    # Neither the source seed list nor WM optimizer settings govern agent training.
+    config["pretrain"].update(seeds=[99], epochs=0, world_lr=0)
+    settings.validate(config, "train")
+    checkpoints = training.load_world_models(config, world_pairs)
+    for (seed, modality), checkpoint in checkpoints.items():
+        directory = training.run_directory(tmp_path / "agents", seed, modality)
+        training.run_training(config, seed, modality, checkpoint, directory)
+        source, world = checkpoint
+        initial = torch.load(directory / "episode-000000.pt", weights_only=False)
+        result = torch.load(directory / "episode-000002.pt", weights_only=False)
+        for key, value in world["world"].items():
+            torch.testing.assert_close(
+                result["agent"][f"world.{key}"], value, rtol=0, atol=0
+            )
+        assert any(
+            not torch.equal(value, result["agent"][key])
+            for key, value in initial["agent"].items()
+            if key.startswith("policy.")
+        )
+        assert result["counter"]["world_updates"] == world["world_updates"]
+        assert (
+            result["counter"]["world_training_seconds"]
+            == world["world_training_seconds"]
+        )
+        assert result["counter"]["agent_updates"] > 0
+        assert result["counter"]["agent_training_seconds"] > 0
+        assert result["world_checkpoint"] == str(source)
+        assert result["world_seed"] == seed
+        assert (
+            not {"policy_optimizer", "world_optimizer", "torch_rng", "metric_rows"}
+            & result.keys()
+        )
+        assert [p.name for p in sorted(directory.glob("episode-*.pt"))] == [
+            "episode-000000.pt",
+            "episode-000001.pt",
+            "episode-000002.pt",
+        ]
+        assert_tensorboard_matches_csv(directory)
+        assert_tensorboard_matches_csv(
+            training.run_directory(world_pairs, seed, modality)
+        )
+        with pytest.raises(FileExistsError):
+            training.run_training(config, seed, modality, checkpoint, directory)
+
+
+@pytest.mark.parametrize("missing", ["combined", "later_seed"])
+def test_missing_pair_prevents_all_agent_training(
+    config, tmp_path, world_pairs, monkeypatch, missing
+):
+    if missing == "combined":
+        (world_pairs / "seed-0/combined/world-final.pt").unlink()
+    else:
+        config["train"]["seeds"] = [0, 1]
+
+    def reject_training(*args, **kwargs):
+        raise AssertionError("No agent may start before every pair is checked")
+
+    monkeypatch.setattr(training, "run_training", reject_training)
+    monkeypatch.setattr(training, "load_config", lambda *args: config)
+    output = tmp_path / "agents"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_agent.py", "--world-models", str(world_pairs), "--output", str(output)],
     )
-    assert result["counter"]["agent_updates"] > 0
+    with pytest.raises(FileNotFoundError, match="Required final world model"):
+        training.main()
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["seed", "modality", "version", "environment", "epoch", "weights", "nonfinite"],
+)
+def test_incompatible_pair_prevents_training(config, world_pairs, damage, monkeypatch):
+    path = world_pairs / "seed-0/combined/world-final.pt"
+    state = torch.load(path, weights_only=False)
+    if damage == "seed":
+        state["seed"] = 1
+    elif damage == "modality":
+        state["modality"] = "vector"
+    elif damage == "version":
+        state["experiment_version"] = -1
+    elif damage == "environment":
+        state["environment"]["pole_mass"] = 99
+    elif damage == "epoch":
+        state["epoch"] = 0
+    elif damage == "weights":
+        state["world"].pop("mean")
+    else:
+        state["world"]["mean"].fill_(float("nan"))
+    torch.save(state, path)
+    monkeypatch.setattr(training, "load_config", lambda *args: config)
+    monkeypatch.setattr(
+        sys, "argv", ["train_agent.py", "--world-models", str(world_pairs)]
+    )
+    with pytest.raises(ValueError, match="checkpoint"):
+        training.main()
+    assert not (Path(config["run"]["output"]) / "agents").exists()
+
+
+def test_pretraining_failure_does_not_publish_final(config, tmp_path, monkeypatch):
+    write_dataset(config, tmp_path)
+    payload = pretraining.load_dataset(config)
+    directory = tmp_path / "failed"
+
+    def fail_evaluation(*args):
+        raise RuntimeError("Evaluation failed")
+
+    monkeypatch.setattr(pretraining, "next_step_mae", fail_evaluation)
+    with pytest.raises(RuntimeError, match="Evaluation failed"):
+        pretraining.run_pretraining(config, 0, "vector", payload, directory)
+    assert not (directory / "world-final.pt").exists()
+    with pytest.raises(FileExistsError):
+        pretraining.run_pretraining(config, 0, "vector", payload, directory)
+
+
+def test_output_preflight_checks_later_pairs(tmp_path):
+    (tmp_path / "seed-1/combined").mkdir(parents=True)
+    with pytest.raises(FileExistsError):
+        training.check_output(tmp_path, [0, 1])
+    assert not (tmp_path / "seed-0").exists()
+
+
+@pytest.mark.parametrize("stage", ["pretrain", "train"])
+@pytest.mark.parametrize("seeds", [[], [0, 0], [-1], [2**32], [True], [0.5]])
+def test_invalid_stage_seeds_fail(config, stage, seeds):
+    config[stage]["seeds"] = seeds
+    with pytest.raises(ValueError, match="seeds"):
+        settings.validate(config, stage)
+
+
+def test_pretraining_does_not_validate_agent_settings(config):
+    config["train"]["seeds"] = []
+    config.pop("ppo")
+    config.pop("train_eval")
+    settings.validate(config, "pretrain")
 
 
 def assert_tensorboard_matches_csv(directory):
@@ -414,11 +492,7 @@ def assert_tensorboard_matches_csv(directory):
     ).Reload()
     with (directory / "metrics.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    tags = {
-        row["metric"]
-        for row in rows
-        if row["metric"].startswith(("pretrain/wm/", "train/ppo/", "train/wm/"))
-    }
+    tags = {row["metric"] for row in rows}
     assert set(events.Tags()["scalars"]) == tags
     for tag in tags:
         records = [row for row in rows if row["metric"] == tag]
@@ -427,52 +501,73 @@ def assert_tensorboard_matches_csv(directory):
             int(row["step"]) for row in records
         ]
         assert [event.value for event in scalars] == pytest.approx(
-            [float(row["value"]) for row in records]
+            [float(row["value"]) for row in records], nan_ok=True
         )
+
+
+def test_pretraining_mae_uses_action_and_next_frame(config):
+    world = WorldModel("vector")
+    world.mean.copy_(torch.tensor([2.0, 3.0, 4.0]))
+    world.std.copy_(torch.tensor([2.0, 4.0, 6.0]))
+    data = {"vector": torch.zeros(3, 4, 3), "action": torch.tensor([0, 1, 1])}
+    data["next_vector"] = world.mean + data["action"][:, None] * world.std
+    world.encode = lambda vector, image: torch.zeros(len(vector), 16)
+    world.predict = lambda latent, action: action[:, None].expand(-1, 16).float()
+    world.decode = lambda latent: {
+        "vector": latent[:, :3, None].transpose(1, 2).expand(-1, 4, -1)
+    }
+    config["pretrain_eval"]["batch_size"] = 2
+    assert list(pretraining.next_step_mae(world, data, config, "cpu").values()) == [
+        0.0,
+        0.0,
+        0.0,
+    ]
+    data["next_vector"] += torch.tensor([1.0, 2.0, 3.0])
+    assert list(pretraining.next_step_mae(world, data, config, "cpu").values()) == [
+        1.0,
+        2.0,
+        3.0,
+    ]
 
 
 def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
     config["pretrain"].update(epochs=11, batch_size=4)
     data = random_rollouts(training.environment_settings(config), 4, 0)
     test = random_rollouts(training.environment_settings(config, ood=True), 2, 20)
-    agent = Agent("vector")
-    optimizer = torch.optim.Adam(agent.world.parameters(), lr=0.001)
-    counter = {"world_updates": 0, "world_training_seconds": 0.0}
-    writer = training.MetricWriter(tmp_path)
-    try:
-        training.pretrain(
-            agent,
-            data,
-            optimizer,
-            config,
-            counter,
-            writer,
-            torch.device("cpu"),
-            tmp_path,
-            0,
-            "vector",
-            test,
-        )
-    finally:
-        writer.close()
-    with (tmp_path / "metrics.csv").open(newline="") as handle:
+    directory = tmp_path / "world"
+    pretraining.run_pretraining(
+        config, 0, "vector", {"training": data, "pretrain_evaluation": test}, directory
+    )
+    with (directory / "metrics.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert_tensorboard_matches_csv(tmp_path)
+    assert_tensorboard_matches_csv(directory)
     mae = [row for row in rows if row["metric"] == "pretrain/wm/mae_cartPos_test"]
     assert [int(row["step"]) for row in mae] == [5, 10, 11]
     assert len([row for row in rows if row["metric"] == "pretrain/wm/loss_total"]) == 11
+    world = WorldModel("vector")
     for row in mae:
         epoch = int(row["step"])
-        state = torch.load(tmp_path / f"world-epoch-{epoch:03d}.pt", weights_only=False)
-        agent.world.load_state_dict(state["world"])
-        expected = training.reconstruction_mae(agent.world, test, config, "cpu")
+        state = torch.load(
+            directory / f"world-epoch-{epoch:03d}.pt", weights_only=False
+        )
+        world.load_state_dict(state["world"])
+        expected = pretraining.next_step_mae(world, test, config, "cpu")
         assert float(row["value"]) == pytest.approx(expected["cartPos"])
         assert state["world_updates"] == epoch
-    assert [p.name for p in sorted(tmp_path.glob("world-epoch-*.pt"))] == [
+    assert [p.name for p in sorted(directory.glob("world-epoch-*.pt"))] == [
         "world-epoch-005.pt",
         "world-epoch-010.pt",
         "world-epoch-011.pt",
     ]
+    final = torch.load(directory / "world-final.pt", weights_only=False)
+    assert final["epoch"] == 11
+    for key, value in state["world"].items():
+        torch.testing.assert_close(final["world"][key], value, rtol=0, atol=0)
+    torch.testing.assert_close(final["world"]["mean"], data["next_vector"].mean(0))
+    torch.testing.assert_close(
+        final["world"]["std"],
+        data["next_vector"].std(0, unbiased=False).clamp_min(1e-6),
+    )
 
 
 def test_losses_average_modalities_and_use_shifted_history():
@@ -520,12 +615,28 @@ def test_reconstruction_trains_encoder_and_decoder_without_dynamics(config):
 
 @pytest.mark.parametrize("key", ["cart_mass", "hinge_damping"])
 def test_evaluation_rejects_training_parameters(config, key):
-    # Both dimensions must overlap before the boxes overlap.
-    config["environment"]["ood"] = {
-        name: config["train"][name][:] for name in ("cart_mass", "hinge_damping")
-    }
+    config["environment"]["ood"][key] = config["train"][key][:]
     with pytest.raises(ValueError, match="outside the training"):
-        training.validate(config)
+        settings.validate(config, "train")
+
+
+@pytest.mark.parametrize("bounds", [[0.25, 1.5], [0.25, 0.75], [0.75, 1.5], [1.5, 2]])
+def test_ood_sampling_excludes_training(config, bounds):
+    config["train"]["cart_mass"] = [0.5, 1.0]
+    config["environment"]["ood"]["cart_mass"] = bounds
+    settings.validate_ranges(config)
+    env = HistoryStackWrapper(
+        settings.environment_settings(config, ood=True), images=False
+    )
+    try:
+        samples = [env.reset(seed=seed)[1]["cart_mass"] for seed in range(200)]
+    finally:
+        env.close()
+    assert all(bounds[0] <= value <= bounds[1] for value in samples)
+    assert all(value < 0.5 or value > 1.0 for value in samples)
+    if bounds == [0.25, 1.5]:
+        # The right interval is twice as wide as the left interval.
+        assert 0.55 < np.mean(np.array(samples) > 1.0) < 0.8
 
 
 @pytest.mark.parametrize("modality", ["vector", "combined"])
@@ -593,13 +704,10 @@ def test_joint_evaluation_uses_policy_rollouts(config, modality, horizon, monkey
         torch.testing.assert_close(value, before[key], rtol=0, atol=0)
 
 
-def test_old_experiment_artifacts_are_rejected(config, tmp_path):
+def test_dataset_requires_evaluation_metadata(config, tmp_path):
     write_dataset(config, tmp_path)
     dataset = torch.load(config["pretrain"]["dataset"], weights_only=False)
     dataset.pop("evaluation_environment")
     torch.save(dataset, config["pretrain"]["dataset"])
     with pytest.raises(ValueError, match="Dataset environment changed"):
-        training.shared_data(config, 0, tmp_path)
-    torch.save({"ppo_backend": "torchrl"}, tmp_path / "old.pt")
-    with pytest.raises(ValueError, match="previous experiment definition"):
-        training.load_checkpoint(tmp_path / "old.pt")
+        pretraining.load_dataset(config)

@@ -54,7 +54,7 @@ class WorldModel(nn.Module):
 
     def encode(self, vector=None, image=None):
         """Encode a batch of four-frame histories."""
-        features = [self.vector_encoder(((vector - self.mean) / self.std).flatten(1))]
+        features = [self.vector_encoder(vector.flatten(1))]
         if self.has_image:
             features.append(self.image_encoder(image.float() / 255))
         return self.projection(torch.cat(features, dim=1))
@@ -104,7 +104,6 @@ class WorldModel(nn.Module):
                     )
 
                 if out_mode == "vector":
-                    target = (target - self.mean) / self.std
                     weight = vector_weight
                 else:
                     target = target.float() / 255

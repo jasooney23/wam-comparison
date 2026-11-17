@@ -47,7 +47,7 @@ def generate(env_settings, count, seed, fixed_params=None):
     print(f"Generating {count:,} samples...", flush=True)
     try:
         for i in range(count):
-            # Reject histories that end before all four frames are available.
+            # Reject histories that end before all four frames are available
             while True:
                 env.reset(seed=int(rng.integers(2**32)))
                 base = env.unwrapped
@@ -64,6 +64,8 @@ def generate(env_settings, count, seed, fixed_params=None):
                     )
                     if terminated or truncated:
                         break
+
+                # if state is valid
                 if not terminated and not truncated:
                     break
 

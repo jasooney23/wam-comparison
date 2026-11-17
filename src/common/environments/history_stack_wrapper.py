@@ -11,6 +11,37 @@ from torch.nn import functional as F
 from .cartpole import CartPoleEnv
 
 
+def sample_parameter(rng, bounds, excluded=None):
+    """Sample uniformly from bounds with an optional interval removed.
+
+    Args:
+        rng: Environment random number generator.
+        bounds: Lower and upper sampling bounds.
+        excluded: Optional closed interval to exclude.
+
+    Returns:
+        A sampled parameter value.
+
+    Raises:
+        ValueError: No values remain outside the excluded interval.
+    """
+    low, high = bounds
+    if excluded is None or high < excluded[0] or low > excluded[1]:
+        return rng.uniform(low, high)
+    left = max(0.0, min(high, excluded[0]) - low)
+    right = max(0.0, high - max(low, excluded[1]))
+    if left + right == 0:
+        raise ValueError("Parameter range has no values outside the training range")
+    offset = rng.uniform(0, left + right)
+    value = low + offset if offset < left else max(low, excluded[1]) + offset - left
+    # Keep floating point boundary values outside the closed training interval.
+    if value == excluded[0]:
+        return np.nextafter(excluded[0], low)
+    if value == excluded[1]:
+        return np.nextafter(excluded[1], high)
+    return value
+
+
 class HistoryStackWrapper(gym.Wrapper):
     """Stack the past G states as the observation.
 
@@ -77,9 +108,13 @@ class HistoryStackWrapper(gym.Wrapper):
         mass, damping = (
             self.fixed_params
             if self.fixed_params is not None
-            else (
-                base.np_random.uniform(*self.settings["cart_mass"]),
-                base.np_random.uniform(*self.settings["hinge_damping"]),
+            else tuple(
+                sample_parameter(
+                    base.np_random,
+                    self.settings[key],
+                    self.settings.get("excluded_ranges", {}).get(key),
+                )
+                for key in ("cart_mass", "hinge_damping")
             )
         )
 

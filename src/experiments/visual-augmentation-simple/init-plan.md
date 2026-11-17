@@ -49,31 +49,31 @@
         - Environment steps
         - Training updates (WM and agent separately)
 
-- Evaluation
-    - Use the following as evaluation metrics:
-    - WM: MAE of each state variable separately. i.e one loss for cart position, one for cart velocity, and one for pole angle
-        - Evaluate up to the horizon EVAL_HORIZON = 4. e.g. evaluate the error directly reconstructing the state, error after one step on the policy action with the dynamics latent, then again, all the way up to 4 dynamics steps. EVAL_HORIZON = 0 means no horizon evaluation, and only evaluation on the immediate step.
-    - Agent: Episodic return
-    - tensorboard tracking
-        - WM pretraining, report under pretrain/wm/:
-            - Total loss (loss_total)
-            - Reconstruction and Dynamics loss (loss_rec and loss_dyn)
-            - Per-variable MAE over the training dataset (mae_{cartPos/cartVel/poleAngle}_train)
-            - Per-variable MAE over out-of-distribution test set (mae_{cartPos/cartVel/poleAngle}_test)
-            - wall time (wall_time)
-            - gradient steps i.e. training updates (grad_steps)
-        - Agent training, report under train/ppo/:
-            - Episodic return (episode_return)
-        - Frozen WM during agent training, report under train/wm/:
-            - Per-variable MAE over the observations during agent training, one per agent update i.e. evaluate on what the agent sees (mae_{cartPos/cartVel/poleAngle})
+## Evaluation
+- Use the following as evaluation metrics:
+- WM: MAE of each state variable separately. i.e one loss for cart position, one for cart velocity, and one for pole angle
+    - Evaluate up to the horizon EVAL_HORIZON = 4. e.g. evaluate the error directly reconstructing the state, error after one step on the policy action with the dynamics latent, then again, all the way up to 4 dynamics steps. EVAL_HORIZON = 0 means no horizon evaluation, and only evaluation on the immediate step.
+- Agent: Episodic return
+- tensorboard tracking
+    - WM pretraining, report under pretrain/wm/:
+        - Total loss (loss_total)
+        - Reconstruction and Dynamics loss (loss_rec and loss_dyn)
+        - Per-variable MAE over the training dataset (mae_{cartPos/cartVel/poleAngle}_train)
+        - Per-variable MAE over out-of-distribution test set (mae_{cartPos/cartVel/poleAngle}_test)
+        - wall time (wall_time)
+        - gradient steps i.e. training updates (grad_steps)
+    - Agent training, report under train/ppo/:
+        - Episodic return (episode_return)
+    - Frozen WM during agent training, report under train/wm/:
+        - Per-variable MAE over the observations during agent training, one per agent update i.e. evaluate on what the agent sees (mae_{cartPos/cartVel/poleAngle})
 
 
-- Training
-    - Pre-train the WM on a fixed dataset
-        - Checkpoint at periodic intervals for number of training updates/passes of dataset (e.g. one checkpoint every 5 epochs)
-    - Then train the agent
-        - The WM is frozen during agent training
-    - Separate the training phases: training script can be set to traing WM > Agent, or use existing WM and train a new agent only
+## Training
+- Pre-train the WM on a fixed dataset
+    - Checkpoint at periodic intervals for number of training updates/passes of dataset (e.g. one checkpoint every 5 epochs)
+- Then train the agent
+    - The WM is frozen during agent training
+- Separate the training phases: training script can be set to traing WM > Agent, or use existing WM and train a new agent only
 
 - WM Pre-training dataset
     - Generate by artificially constructing possible states for the env
@@ -87,6 +87,14 @@
     - Joint agent-WM evaluation settings are under `train_eval`; evaluate both on the same generated OOD policy rollouts.
     - Write one metrics CSV per seed and modality, including every TensorBoard metric.
     - Do not generate charts or comparison exports.
+
+
+## Split WM and Agent
+- Pre-train WM first on synthetic env dataset
+    - Then, compare the two WM approaches: what the difference in performance is
+    - From pre-training, export saved WMs
+- Train agent on WMs afterwards
+
 
 ## Guidelines
 - Envs should be built under the Gymnasium structure

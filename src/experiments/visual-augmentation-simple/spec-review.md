@@ -5,12 +5,18 @@ The experiment now uses the config and evaluation layout described in
 artifact workflow reviewed on 2026-11-15.
 
 - Pretraining uses 10,000 ID pairs and 500 OOD pairs, sampled from shared ranges.
-- Pretraining reconstruction evaluation and checkpoints run every five epochs
+- Pretraining next-step prediction evaluation and checkpoints run every five epochs
   by default, and at the final epoch.
 - Agent training freezes the WM. Periodic joint evaluation uses generated OOD
   policy episodes for both agent return and WM horizon errors.
-- Each run writes one metrics CSV. All TensorBoard scalars also appear there.
-- Agent-only and resumed runs use saved normalization and need no dataset.
+- WM pretraining and agent training have separate scripts and output directories.
+- Both stages always train vector and combined using their own configured seeds.
+- Agent seed N requires both completed WM saves for seed N before any training starts.
+- Each stage/run writes one metrics CSV and matching TensorBoard scalars, including
+  evaluation and compute metrics.
+- Agent training uses saved normalization and needs no dataset. Resume is removed.
+- Pretraining publishes final WM artifacts; agent evaluation saves model snapshots
+  with source WM provenance and no optimizer or random-generator state.
 - No automatic chart or comparison artifacts are produced.
 
 Current validation results should come from running the test suite and smoke
