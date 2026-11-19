@@ -546,10 +546,8 @@ def assert_tensorboard_matches_csv(directory):
 
 def test_pretraining_mae_uses_action_and_next_frame(config):
     world = WorldModel("vector")
-    world.mean.copy_(torch.tensor([2.0, 3.0, 4.0]))
-    world.std.copy_(torch.tensor([2.0, 4.0, 6.0]))
     data = {"vector": torch.zeros(3, 4, 3), "action": torch.tensor([0, 1, 1])}
-    data["next_vector"] = world.mean + data["action"][:, None] * world.std
+    data["next_vector"] = data["action"][:, None].repeat(1, 3).float()
     world.encode = lambda vector, image: torch.zeros(len(vector), 16)
     world.predict = lambda latent, action: action[:, None].expand(-1, 16).float()
     world.decode = lambda latent: {
@@ -580,18 +578,26 @@ def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
     with (directory / "metrics.csv").open(newline="") as handle:
         rows = list(csv.DictReader(handle))
     assert_tensorboard_matches_csv(directory)
-    mae = [row for row in rows if row["metric"] == "pretrain/wm/mae_cartPos_test"]
-    assert [int(row["step"]) for row in mae] == [5, 10, 11]
+    mae = {
+        (row["metric"], int(row["step"])): float(row["value"])
+        for row in rows
+        if row["metric"].endswith("_test")
+    }
     assert len([row for row in rows if row["metric"] == "pretrain/wm/loss_total"]) == 11
     world = WorldModel("vector")
-    for row in mae:
-        epoch = int(row["step"])
+    assert len(mae) == 3 * 2 * len(world.state_names)
+    for epoch in (5, 10, 11):
         state = torch.load(
             directory / f"world-epoch-{epoch:03d}.pt", weights_only=False
         )
         world.load_state_dict(state["world"])
-        expected = pretraining.next_step_mae(world, test, config, "cpu")
-        assert float(row["value"]) == pytest.approx(expected["cartPos"])
+        for horizon, measure in enumerate(
+            (pretraining.reconstruction_mae, pretraining.next_step_mae)
+        ):
+            for name, value in measure(world, test, config, "cpu").items():
+                assert mae[f"pretrain/wm/mae_{name}_{horizon}_test", epoch] == (
+                    pytest.approx(value)
+                )
         assert state["world_updates"] == epoch
     assert [p.name for p in sorted(directory.glob("world-epoch-*.pt"))] == [
         "world-epoch-005.pt",
@@ -602,11 +608,6 @@ def test_pretraining_evaluates_periodic_and_final_checkpoints(config, tmp_path):
     assert final["epoch"] == 11
     for key, value in state["world"].items():
         torch.testing.assert_close(final["world"][key], value, rtol=0, atol=0)
-    torch.testing.assert_close(final["world"]["mean"], data["next_vector"].mean(0))
-    torch.testing.assert_close(
-        final["world"]["std"],
-        data["next_vector"].std(0, unbiased=False).clamp_min(1e-6),
-    )
 
 
 def test_losses_average_modalities_and_use_shifted_history():

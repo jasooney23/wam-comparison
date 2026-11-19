@@ -12,6 +12,7 @@ from training_utils import (
     MetricWriter,
     check_output,
     checked_step,
+    next_step_mae,
     prepare_run,
     reconstruction_mae,
     run_directory,
@@ -105,14 +106,16 @@ def run_pretraining(config, seed, modality, payload, directory):
                 epoch % settings["eval_every"] == 0 or epoch == settings["epochs"]
             )
             if evaluating:
-                for label, observations in (
-                    ("train", data),
-                    ("test", payload["pretrain_evaluation"]),
+                test_data = payload["pretrain_evaluation"]
+                for suffix, observations, measure in (
+                    ("train", data, reconstruction_mae),
+                    ("0_test", test_data, reconstruction_mae),
+                    ("1_test", test_data, next_step_mae),
                 ):
                     metrics.update(
                         {
-                            f"mae_{name}_{label}": value
-                            for name, value in reconstruction_mae(
+                            f"mae_{name}_{suffix}": value
+                            for name, value in measure(
                                 world, observations, config, device
                             ).items()
                         }

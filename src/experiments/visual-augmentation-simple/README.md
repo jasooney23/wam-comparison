@@ -60,7 +60,7 @@ episodes per modality. These checks verify behavior, not training quality.
 - `environment.ood`: shared OOD ranges for both evaluation phases.
 - `pretrain`: WM seeds, dataset path, ID pair count, epochs, optimizer settings,
   gradient clipping, batch size, loss weights, and `eval_every` (default 5 epochs).
-- `pretrain_eval`: OOD pair count (default 500) and next-step prediction evaluation batch size.
+- `pretrain_eval`: OOD pair count (default 500) and MAE evaluation batch size.
 - `train_eval`: joint evaluation interval in agent episodes, evaluation episode
   count, and WM prediction horizon.
 - `ppo`: rollout size, minibatches, epochs, discount, GAE, and loss settings.
@@ -94,12 +94,10 @@ The default 32 by 32 images require about 54 MB across the two splits.
 Regenerate 64 by 64 datasets and retrain their combined world models for this resolution.
 
 Pretraining losses are sample-weighted epoch averages. Every `pretrain.eval_every`
-epochs and at the final epoch, evaluate next-step prediction MAE over
-all ID training pairs and all saved OOD pairs, then save a world-model checkpoint.
-MAE encodes each history, advances its latent with the stored action, and decodes
-the result. It compares the newest predicted frame with the stored `next_vector`
-in original physical units. OOD pairs never train the
-model or set normalization statistics.
+epochs and at the final epoch, evaluate MAE in physical units and save a checkpoint.
+Horizon 0 compares the reconstructed latest frame with the latest observed frame
+on the training and OOD splits. Horizon 1 advances the OOD latent with the stored
+action once and compares the decoded latest frame with `next_vector`.
 
 During agent training, periodic joint evaluation generates OOD policy episodes.
 Agent return and WM prediction errors use these same episodes, not separate
@@ -132,8 +130,8 @@ with the same tag and step. Phase prefixes identify the step axis:
 | `compute/` | Completed training episodes | CSV and TensorBoard |
 
 Pretraining tags are `loss_total`, `loss_rec`, `loss_dyn`, `wall_time`,
-`grad_steps`, and `mae_{cartPos/cartVel/poleAngle/poleVel}_{train/test}`
-for the selected state elements.
+`grad_steps`, and `mae_{variable}_train`, `mae_{variable}_0_test`, and
+`mae_{variable}_1_test` for each selected state variable.
 Losses and compute are logged each epoch; MAE follows `pretrain.eval_every`.
 Agent-observation tags are `train/wm/mae_{cartPos/cartVel/poleAngle/poleVel}`
 for the selected state elements.
