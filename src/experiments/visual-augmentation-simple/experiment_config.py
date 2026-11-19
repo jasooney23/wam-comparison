@@ -1,8 +1,18 @@
-"""Shared physics settings for dataset generation and training."""
+"""Shared environment settings for dataset generation and training."""
 
 import copy
 import math
+import sys
 import tomllib
+from pathlib import Path
+
+# Allow the experiment scripts to run directly.
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from src.common.environments.cartpole.observations import (
+    OBSERVATION_DEFAULTS,
+    observation_layout,
+)
 
 
 def environment_settings(config, *, ood=False):
@@ -15,17 +25,36 @@ def environment_settings(config, *, ood=False):
     Returns:
         Environment settings accepted by HistoryStackWrapper.
     """
-    ranges = config["environment"]["ood"] if ood else config["train"]
+    environment = config["environment"]
+    ranges = environment["ood"] if ood else config["train"]
     result = {
-        "pole_mass": config["environment"]["pole_mass"],
-        "max_steps": config["environment"]["max_steps"],
+        "pole_mass": environment["pole_mass"],
+        "max_steps": environment["max_steps"],
+        **{
+            key: environment.get(key, default)
+            for key, default in OBSERVATION_DEFAULTS.items()
+        },
         **{key: ranges[key] for key in ("cart_mass", "hinge_damping")},
     }
+    observation_layout(result)
     if ood:
         result["excluded_ranges"] = {
             key: config["train"][key] for key in ("cart_mass", "hinge_damping")
         }
     return result
+
+
+def matches_environment(saved, expected):
+    """Check saved settings with observation defaults for older artifacts.
+
+    Args:
+        saved: Environment settings saved in the artifact.
+        expected: Environment settings for this run.
+
+    Returns:
+        Whether the saved settings match this run.
+    """
+    return isinstance(saved, dict) and (OBSERVATION_DEFAULTS | saved) == expected
 
 
 def validate_ranges(config):
@@ -139,7 +168,8 @@ def smoke_config(config):
     config = copy.deepcopy(config)
     config["pretrain"]["seeds"] = [0]
     config["train"]["seeds"] = [0]
-    config["environment"]["max_steps"] = 30
+    frames, _ = observation_layout(config["environment"])
+    config["environment"]["max_steps"] = max(30, frames)
     config["pretrain"].update(transitions=32, epochs=1, batch_size=8)
     config["train"]["episodes"] = 2
     config["ppo"].update(rollout_steps=16, minibatch_size=8, epochs=1)

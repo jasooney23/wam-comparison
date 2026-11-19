@@ -37,13 +37,15 @@ uv run python src/experiments/visual-augmentation-simple/train_agent.py --world-
 Agent training needs no dataset. WMs remain frozen, including their saved
 normalization statistics. Agent snapshots record the source WM path and seed.
 There is no resume support. Existing run directories are never overwritten;
-choose a new stage output directory to rerun training. Old checkpoints are not
-supported by this workflow.
+choose a new stage output directory to rerun training. Checkpoints must match
+the experiment version.
 
 The generator also refuses to overwrite its dataset. Choose a new
 `pretrain.dataset` path when regenerating; its `--output` overrides the dataset
-destination. Existing datasets remain usable when their ID/OOD physics metadata
-and pair counts match the configuration.
+destination. Existing datasets remain usable when their image size, ID/OOD
+environment settings, and pair counts match the experiment. Datasets and
+checkpoints that predate the observation settings use the default observation
+layout.
 
 For a CPU smoke check, set `run.device = "cpu"`, use a separate `run.output`
 and `pretrain.dataset`, and pass `--smoke` to all three commands. This uses seed
@@ -53,7 +55,7 @@ episodes per modality. These checks verify behavior, not training quality.
 ## Configuration
 
 - `run`: shared output root, device, and CPU threads.
-- `environment`: pole mass and episode limit.
+- `environment`: pole mass, episode limit, and CartPole observation settings.
 - `train`: agent seeds, episode count, policy learning rate, and shared ID ranges.
 - `environment.ood`: shared OOD ranges for both evaluation phases.
 - `pretrain`: WM seeds, dataset path, ID pair count, epochs, optimizer settings,
@@ -62,6 +64,14 @@ episodes per modality. These checks verify behavior, not training quality.
 - `train_eval`: joint evaluation interval in agent episodes, evaluation episode
   count, and WM prediction horizon.
 - `ppo`: rollout size, minibatches, epochs, discount, GAE, and loss settings.
+
+`environment.history_frames` sets the number of frames in each vector and
+image history. It defaults to 4 and must be a positive integer. The dataset
+generator requires `max_steps` to be at least `history_frames`.
+The boolean flags `input_cart_pos`, `input_cart_vel`, `input_pole_angle`, and
+`input_pole_vel` select vector elements in that order. Enable at least one.
+By default, the first three are enabled. Changing the frame count or enabled
+elements requires a matching dataset and world-model checkpoint.
 
 ID physics use the cart mass and hinge damping ranges under `train`.
 Each OOD parameter is sampled uniformly from its `environment.ood` range after
@@ -76,11 +86,12 @@ stay constant during a history or episode. There are no fixed holdout settings.
 
 The generator saves 10,000 ID pairs and 500 OOD pairs in one file. It samples
 cart position and pole angle within termination limits, and cart velocity and
-pole angular velocity in `[-2, 2]`. It simulates three random steps to make a
-four-frame history, rejecting histories that end early, then saves a uniformly
+pole angular velocity in `[-2, 2]`. It simulates `history_frames - 1` random steps
+to fill the history, rejecting episodes that end early, then saves a uniformly
 sampled action and the next frame. Both splits use this process with independent
 seeds and their respective physics ranges. They need not resemble policy data.
-The default images require about 215 MB across the two splits.
+The default 32 by 32 images require about 54 MB across the two splits.
+Regenerate 64 by 64 datasets and retrain their combined world models for this resolution.
 
 Pretraining losses are sample-weighted epoch averages. Every `pretrain.eval_every`
 epochs and at the final epoch, evaluate next-step prediction MAE over
@@ -121,9 +132,11 @@ with the same tag and step. Phase prefixes identify the step axis:
 | `compute/` | Completed training episodes | CSV and TensorBoard |
 
 Pretraining tags are `loss_total`, `loss_rec`, `loss_dyn`, `wall_time`,
-`grad_steps`, and `mae_{cartPos/cartVel/poleAngle}_{train/test}`.
+`grad_steps`, and `mae_{cartPos/cartVel/poleAngle/poleVel}_{train/test}`
+for the selected state elements.
 Losses and compute are logged each epoch; MAE follows `pretrain.eval_every`.
-Agent-observation tags are `train/wm/mae_{cartPos/cartVel/poleAngle}`.
+Agent-observation tags are `train/wm/mae_{cartPos/cartVel/poleAngle/poleVel}`
+for the selected state elements.
 Every TensorBoard value is also written to the CSV with the same tag and step.
 Joint evaluation records return mean/spread, per-variable `mae_*_hN_ood`, and
 `windows_hN`. Compute records world/agent training seconds, optimizer updates,
@@ -152,16 +165,14 @@ uv run tensorboard --logdir outputs/visual-augmentation-simple
 
 ## Models and physics
 
-Each input contains four `(cart_position, cart_velocity, pole_angle)` vectors;
-reset repeats the first frame. Combined models also receive four 64 by 64
-grayscale images. The full four-state simulator observation and physics
-parameters are never fed to the model. Rendering exposes no direct mass or
-damping cue. Angular velocity can still be inferred from temporal observations,
-so an advantage from images is not guaranteed.
+Each vector frame contains the selected CartPole state elements. Reset repeats
+the first frame to fill the history. Combined models also receive a 32 by 32
+grayscale image for each frame. Rendering exposes no direct mass or damping cue.
 
 Vector MLP and image CNN features project to a shared latent of size 16.
 Action-conditioned latent dynamics predict the next latent. Decoders reconstruct
-four-frame histories. MLPs used by the experiment have one hidden layer of 32.
+histories of the configured length. MLPs used by the experiment have one hidden
+layer of 32.
 Images are scaled to `[0, 1]`; vectors use training-only means and standard
 deviations. Reconstruction and dynamics losses each sum weighted modality MSE,
 then the two losses are summed. Dynamics targets shift the history and append

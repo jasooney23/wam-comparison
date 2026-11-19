@@ -6,7 +6,7 @@ from time import perf_counter
 
 import numpy as np
 import torch
-from experiment_config import environment_settings, load_config
+from experiment_config import environment_settings, load_config, matches_environment
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torchrl.envs.utils import ExplorationType, set_exploration_type
@@ -16,7 +16,6 @@ from torchrl.objectives.value import GAE
 from training_utils import (
     EXPERIMENT_VERSION,
     MODALITIES,
-    TENSORBOARD_STATE_NAMES,
     MetricWriter,
     check_output,
     checked_step,
@@ -169,7 +168,8 @@ def evaluate(agent, actor, config, seed, device):
         Each horizon uses every available window within episode boundaries.
     """
     horizon = config["train_eval"]["horizon"]
-    totals = torch.zeros((horizon + 1, 3), device=device)
+    state_names = agent.world.state_names
+    totals = torch.zeros((horizon + 1, len(state_names)), device=device)
     counts = torch.zeros(horizon + 1, device=device)
     scores = []
     env = HistoryStackWrapper(
@@ -217,9 +217,7 @@ def evaluate(agent, actor, config, seed, device):
         "return_std_ood": float(np.std(scores)),
     }
     for step in range(horizon + 1):
-        for name, error in zip(
-            TENSORBOARD_STATE_NAMES, totals[step] / counts[step].clamp_min(1)
-        ):
+        for name, error in zip(state_names, totals[step] / counts[step].clamp_min(1)):
             # A short episode can leave a long horizon without any valid window.
             metrics[f"mae_{name}_h{step}_ood"] = (
                 error.item() if counts[step] else float("nan")
@@ -243,6 +241,7 @@ def load_world_models(config, source):
         ValueError: A world model is incomplete or incompatible.
     """
     checkpoints = {}
+    settings = environment_settings(config)
     for seed in config["train"]["seeds"]:
         for modality in MODALITIES:
             path = run_directory(source, seed, modality) / "world-final.pt"
@@ -255,7 +254,7 @@ def load_world_models(config, source):
                 state.get("experiment_version") != EXPERIMENT_VERSION
                 or state.get("modality") != modality
                 or state.get("seed") != seed
-                or state.get("environment") != environment_settings(config)
+                or not matches_environment(state.get("environment"), settings)
                 or state.get("epoch")
                 != state.get("config", {}).get("pretrain", {}).get("epochs")
                 or "epoch" not in state
@@ -264,7 +263,7 @@ def load_world_models(config, source):
                     f"World checkpoint is incomplete or incompatible: {path}"
                 )
             try:
-                world = WorldModel(modality)
+                world = WorldModel(modality, settings)
                 world.load_state_dict(state["world"])
                 if any(
                     not torch.isfinite(value).all()
@@ -297,7 +296,7 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
     seed_run(seed)
     device = torch.device(config["run"]["device"])
     source, state = checkpoint
-    agent = Agent(modality).to(device)
+    agent = Agent(modality, config["environment"]).to(device)
     agent.world.load_state_dict(state["world"])
     agent.world.requires_grad_(False)
     actor, critic, ppo_loss = ppo_modules(agent, config["ppo"])

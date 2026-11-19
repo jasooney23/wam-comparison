@@ -5,7 +5,7 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
-from experiment_config import environment_settings, load_config
+from experiment_config import environment_settings, load_config, matches_environment
 from training_utils import (
     EXPERIMENT_VERSION,
     MODALITIES,
@@ -21,17 +21,20 @@ from training_utils import (
     to_device,
 )
 
+from src.common.environments.cartpole.observations import IMAGE_SIZE
 from src.common.models.world_model import WorldModel
 
 
 def load_dataset(config):
-    """Load ID/OOD pairs and reject mismatched physics or sample counts."""
+    """Load ID/OOD pairs and check settings, sample counts, and image size."""
     dataset = torch.load(
         config["pretrain"]["dataset"], weights_only=False, map_location="cpu"
     )
-    if dataset.get("environment") != environment_settings(config) or dataset.get(
-        "evaluation_environment"
-    ) != environment_settings(config, ood=True):
+    if not matches_environment(
+        dataset.get("environment"), environment_settings(config)
+    ) or not matches_environment(
+        dataset.get("evaluation_environment"), environment_settings(config, ood=True)
+    ):
         raise ValueError("Dataset environment changed; regenerate the ID/OOD dataset")
     for key, section in (("training", "pretrain"), ("evaluation", "pretrain_eval")):
         if (
@@ -39,6 +42,12 @@ def load_dataset(config):
             or len(dataset[key]["action"]) != config[section]["transitions"]
         ):
             raise ValueError(f"Dataset size does not match {section}.transitions")
+        for name in ("image", "next_image"):
+            images = dataset[key].get(name)
+            if images is None or images.shape[-2:] != (IMAGE_SIZE, IMAGE_SIZE):
+                raise ValueError(
+                    f"Regenerate the dataset with {IMAGE_SIZE}x{IMAGE_SIZE} images"
+                )
     return {
         "training": dataset["training"],
         "pretrain_evaluation": dataset["evaluation"],
@@ -58,7 +67,7 @@ def run_pretraining(config, seed, modality, payload, directory):
     prepare_run(directory, config)
     seed_run(seed)
     device = torch.device(config["run"]["device"])
-    world = WorldModel(modality).to(device)
+    world = WorldModel(modality, config["environment"]).to(device)
     settings = config["pretrain"]
     data = payload["training"]
     optimizer = torch.optim.Adam(world.parameters(), lr=settings["world_lr"])

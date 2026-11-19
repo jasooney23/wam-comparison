@@ -36,16 +36,25 @@ torch.set_num_threads(1)
 
 
 @pytest.fixture
-def config(tmp_path):
+def config(tmp_path, request):
     with (EXPERIMENT / "config.toml").open("rb") as handle:
         result = settings.smoke_config(tomllib.load(handle))
     result["run"].update(device="cpu", output=str(tmp_path))
     result["environment"]["max_steps"] = 5
+    result["environment"].update(getattr(request, "param", {}))
     result["pretrain_eval"]["transitions"] = 8
     return result
 
 
-def test_synthesized_dataset_is_reproducible(config):
+@pytest.mark.parametrize(
+    "config, frames, vector_size",
+    [
+        ({}, 4, 3),
+        ({"history_frames": 1, "max_steps": 1, "input_pole_vel": True}, 1, 4),
+    ],
+    indirect=["config"],
+)
+def test_synthesized_dataset_is_reproducible(config, frames, vector_size):
     spec = importlib.util.spec_from_file_location(
         "dataset_generator", EXPERIMENT / "generate_dataset.py"
     )
@@ -55,8 +64,10 @@ def test_synthesized_dataset_is_reproducible(config):
     second = generator.generate(training.environment_settings(config), 4, 17)
     for key in first:
         torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
-    assert first["image"].shape == (4, 4, 64, 64)
-    assert first["next_vector"].shape == (4, 3)
+    assert first["vector"].shape == (4, frames, vector_size)
+    assert first["image"].shape == (4, frames, 32, 32)
+    assert first["next_image"].shape == (4, 32, 32)
+    assert first["next_vector"].shape == (4, vector_size)
     assert set(first["action"].tolist()) <= {0, 1}
 
 
@@ -164,16 +175,16 @@ def test_model_shapes_and_gradients(modality):
     model = WorldModel(modality)
     batch = {
         "vector": torch.randn(3, 4, 3),
-        "image": torch.randint(256, (3, 4, 64, 64), dtype=torch.uint8),
+        "image": torch.randint(256, (3, 4, 32, 32), dtype=torch.uint8),
         "action": torch.tensor([0, 1, 0]),
         "next_vector": torch.randn(3, 3),
-        "next_image": torch.randint(256, (3, 64, 64), dtype=torch.uint8),
+        "next_image": torch.randint(256, (3, 32, 32), dtype=torch.uint8),
     }
     assert model.encode(batch["vector"], batch["image"]).shape == (3, 16)
     predictions = model(batch["vector"], batch["image"], batch["action"])
     assert predictions["vector"].shape == (3, 4, 3)
     if model.has_image:
-        assert predictions["image"].shape == (3, 4, 64, 64)
+        assert predictions["image"].shape == (3, 4, 32, 32)
     batch = {
         key: value
         for key, value in batch.items()
@@ -331,6 +342,22 @@ def test_dataset_rejects_changed_physics(config, tmp_path):
         pretraining.load_dataset(config)
 
 
+def test_dataset_uses_legacy_observation_defaults(config, tmp_path):
+    write_dataset(config, tmp_path)
+    path = config["pretrain"]["dataset"]
+    dataset = torch.load(path, weights_only=False)
+    for section in ("environment", "evaluation_environment"):
+        for key in settings.OBSERVATION_DEFAULTS:
+            del dataset[section][key]
+    torch.save(dataset, path)
+    pretraining.load_dataset(config)
+
+    # Swap inputs while preserving the vector shape.
+    config["environment"].update(input_cart_vel=False, input_pole_vel=True)
+    with pytest.raises(ValueError, match="Dataset environment"):
+        pretraining.load_dataset(config)
+
+
 @pytest.fixture
 def world_pairs(config, tmp_path):
     write_dataset(config, tmp_path)
@@ -343,6 +370,11 @@ def world_pairs(config, tmp_path):
     return source
 
 
+@pytest.mark.parametrize(
+    "config",
+    [{}, {"history_frames": 2, "input_cart_vel": False, "input_pole_vel": True}],
+    indirect=True,
+)
 def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
     Path(config["pretrain"]["dataset"]).unlink()
     # Neither the source seed list nor WM optimizer settings govern agent training.
@@ -373,6 +405,13 @@ def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
         assert result["counter"]["agent_training_seconds"] > 0
         assert result["world_checkpoint"] == str(source)
         assert result["world_seed"] == seed
+        metric_rows = (directory / "metrics.csv").read_text()
+        assert ("mae_poleVel_h0_ood" in metric_rows) == config["environment"][
+            "input_pole_vel"
+        ]
+        assert ("mae_cartVel_h0_ood" in metric_rows) == config["environment"][
+            "input_cart_vel"
+        ]
         assert (
             not {"policy_optimizer", "world_optimizer", "torch_rng", "metric_rows"}
             & result.keys()
@@ -581,8 +620,8 @@ def test_losses_average_modalities_and_use_shifted_history():
         "next_vector": torch.full((2, 3), 9.0),
         "image": torch.tensor([0, 0, 0, 255], dtype=torch.uint8)
         .view(1, 4, 1, 1)
-        .expand(2, 4, 64, 64),
-        "next_image": torch.full((2, 64, 64), 128, dtype=torch.uint8),
+        .expand(2, 4, 32, 32),
+        "next_image": torch.full((2, 32, 32), 128, dtype=torch.uint8),
         "action": torch.tensor([0, 1]),
     }
     loss, metrics = model.loss(batch, vector_weight=2, image_weight=3)
@@ -696,7 +735,7 @@ def test_joint_evaluation_uses_policy_rollouts(config, modality, horizon, monkey
                 )
             assert metrics[f"windows_h{step}"] == len(errors)
             for name, value in zip(
-                training.TENSORBOARD_STATE_NAMES, torch.cat(errors).mean(0)
+                ("cartPos", "cartVel", "poleAngle"), torch.cat(errors).mean(0)
             ):
                 assert metrics[f"mae_{name}_h{step}_ood"] == pytest.approx(value.item())
     assert metrics == training.evaluate(agent, actor, config, 0, "cpu")

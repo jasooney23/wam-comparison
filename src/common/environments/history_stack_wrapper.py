@@ -1,4 +1,4 @@
-"""Four-frame CartPole observations and shared trajectory collection."""
+"""Stacked CartPole observations and shared trajectory collection."""
 
 from collections import deque
 
@@ -9,6 +9,7 @@ from gymnasium import spaces
 from torch.nn import functional as F
 
 from .cartpole import CartPoleEnv
+from .cartpole.observations import IMAGE_SIZE, observation_layout
 
 
 def sample_parameter(rng, bounds, excluded=None):
@@ -43,16 +44,17 @@ def sample_parameter(rng, bounds, excluded=None):
 
 
 class HistoryStackWrapper(gym.Wrapper):
-    """Stack the past G states as the observation.
+    """Stack the configured number of recent CartPole observations.
 
     Args:
-        settings: Environment config with sampling ranges and episode limit.
+        settings: Environment config with physics and observation settings.
         images: Whether to render image observations.
-        fixed_params: Optional fixed_params cart mass and damping for evaluation.
+        fixed_params: Optional fixed cart mass and damping for evaluation.
         gui: Whether to show the environment in a window.
     """
 
     def __init__(self, settings, images=True, fixed_params=None, gui=False):
+        history_frames, self.state_indices = observation_layout(settings)
         base = CartPoleEnv(
             render_mode="human" if gui else "rgb_array" if images else None,
             pole_mass=settings["pole_mass"],
@@ -63,14 +65,22 @@ class HistoryStackWrapper(gym.Wrapper):
             images,
             fixed_params,
         )
-        self.vectors, self.frames = deque(maxlen=4), deque(maxlen=4)
-        observation_spaces = {"vector": spaces.Box(-np.inf, np.inf, (4, 3), np.float32)}
+        self.vectors, self.frames = (
+            deque(maxlen=history_frames),
+            deque(maxlen=history_frames),
+        )
+        vector_shape = (history_frames, len(self.state_indices))
+        observation_spaces = {
+            "vector": spaces.Box(-np.inf, np.inf, vector_shape, np.float32)
+        }
         if images:
-            observation_spaces["image"] = spaces.Box(0, 255, (4, 64, 64), np.uint8)
+            observation_spaces["image"] = spaces.Box(
+                0, 255, (history_frames, IMAGE_SIZE, IMAGE_SIZE), np.uint8
+            )
         self.observation_space = spaces.Dict(observation_spaces)
 
     def _observe(self, state, initial=False):
-        vector = state[:3].copy()
+        vector = state[self.state_indices].astype(np.float32, copy=False)
         frame = None
 
         # Get image as grayscale
@@ -84,12 +94,12 @@ class HistoryStackWrapper(gym.Wrapper):
                 img_rgb.astype(np.float32), np.array([0.299, 0.587, 0.114], np.float32)
             )
             frame = F.interpolate(
-                torch.from_numpy(img_gray)[None, None], size=(64, 64), mode="area"
+                torch.from_numpy(img_gray)[None, None], size=IMAGE_SIZE, mode="area"
             )
             frame = frame[0, 0].round().clamp(0, 255).numpy().astype(np.uint8)
 
         # Construct stacked obs
-        for _ in range(4 if initial else 1):
+        for _ in range(self.vectors.maxlen if initial else 1):
             self.vectors.append(vector)
             if self.images:
                 self.frames.append(frame)
@@ -150,17 +160,20 @@ def random_rollouts(env_settings, count, seed, fixed_params=None, horizon=0):
         raise ValueError("Count must be positive and horizon below max_steps")
     env = HistoryStackWrapper(env_settings, images=True, fixed_params=fixed_params)
     rng = np.random.default_rng(seed)
+    vector_space = env.observation_space["vector"]
+    image_space = env.observation_space["image"]
+    vector_size = vector_space.shape[-1]
     arrays = {
-        "vector": np.empty((count, 4, 3), np.float32),
-        "image": np.empty((count, 4, 64, 64), np.uint8),
+        "vector": np.empty((count, *vector_space.shape), vector_space.dtype),
+        "image": np.empty((count, *image_space.shape), image_space.dtype),
     }
     if horizon:
         arrays["actions"] = np.empty((count, horizon), np.int64)
-        arrays["targets"] = np.empty((count, horizon + 1, 3), np.float32)
+        arrays["targets"] = np.empty((count, horizon + 1, vector_size), np.float32)
     else:
         arrays["action"] = np.empty(count, np.int64)
-        arrays["next_vector"] = np.empty((count, 3), np.float32)
-        arrays["next_image"] = np.empty((count, 64, 64), np.uint8)
+        arrays["next_vector"] = np.empty((count, vector_size), np.float32)
+        arrays["next_image"] = np.empty((count, *image_space.shape[1:]), np.uint8)
     observation, _ = env.reset(seed=seed)
     observations, actions = [observation], []
     collected = 0
@@ -188,10 +201,9 @@ def random_rollouts(env_settings, count, seed, fixed_params=None, horizon=0):
                 collected += 1
                 observations.pop(0)
                 actions.pop(0)
-            if terminated or truncated:
-                if collected < count:
-                    observation, _ = env.reset()
-                    observations, actions = [observation], []
+            if (terminated or truncated) and collected < count:
+                observation, _ = env.reset()
+                observations, actions = [observation], []
     finally:
         env.close()
     return {key: torch.from_numpy(value) for key, value in arrays.items()}

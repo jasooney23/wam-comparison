@@ -12,11 +12,12 @@ class Agent(nn.Module):
 
     Args:
         modality: World-model observation modality.
+        settings: Optional CartPole observation settings.
     """
 
-    def __init__(self, modality: str):
+    def __init__(self, modality: str, settings=None):
         super().__init__()
-        self.world = WorldModel(modality)
+        self.world = WorldModel(modality, settings)
         self.policy = MLP(16, 2, [32])
         self.value = MLP(16, 1, [32])
 

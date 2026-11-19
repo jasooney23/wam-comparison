@@ -9,16 +9,15 @@ from time import perf_counter
 import numpy as np
 import torch
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT))
-from src.common.environments.history_stack_wrapper import HistoryStackWrapper
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from experiment_config import environment_settings, validate_ranges
 
+from src.common.environments.cartpole.observations import observation_layout
+from src.common.environments.history_stack_wrapper import HistoryStackWrapper
+
 
 def generate(env_settings, count, seed, fixed_params=None):
-    """Sample states and simulate four-frame histories and one target step.
+    """Sample states and simulate observation histories and one target step.
 
     Args:
         env_settings: Environment configuration.
@@ -29,25 +28,28 @@ def generate(env_settings, count, seed, fixed_params=None):
     Returns:
         Observation histories, actions, and next frames as CPU tensors.
     """
-    if count <= 0 or env_settings["max_steps"] < 4:
+    frames, _ = observation_layout(env_settings)
+    if count <= 0 or env_settings["max_steps"] < frames:
         raise ValueError(
-            "Dataset size must be positive and max_steps must be at least 4"
+            "Dataset size must be positive and max_steps must be at least history_frames"
         )
     rng = np.random.default_rng(seed)
     env = HistoryStackWrapper(env_settings, images=True, fixed_params=fixed_params)
+    vector_space = env.observation_space["vector"]
+    image_space = env.observation_space["image"]
     arrays = {
-        "vector": np.empty((count, 4, 3), np.float32),
-        "image": np.empty((count, 4, 64, 64), np.uint8),
+        "vector": np.empty((count, *vector_space.shape), vector_space.dtype),
+        "image": np.empty((count, *image_space.shape), image_space.dtype),
         "action": np.empty(count, np.int64),
-        "next_vector": np.empty((count, 3), np.float32),
-        "next_image": np.empty((count, 64, 64), np.uint8),
+        "next_vector": np.empty((count, *vector_space.shape[1:]), vector_space.dtype),
+        "next_image": np.empty((count, *image_space.shape[1:]), image_space.dtype),
     }
     start = perf_counter()
     last_report = start
     print(f"Generating {count:,} samples...", flush=True)
     try:
         for i in range(count):
-            # Reject histories that end before all four frames are available
+            # Reject episodes that end before the target step.
             while True:
                 env.reset(seed=int(rng.integers(2**32)))
                 base = env.unwrapped
@@ -57,16 +59,15 @@ def generate(env_settings, count, seed, fixed_params=None):
                 base.state = rng.uniform(-limits, limits)
                 observation = env._observe(base.state, initial=True)
 
-                # Generate history stack w/ sampled actions
-                for _ in range(3):
+                # Fill the history with random actions.
+                for _ in range(frames - 1):
                     observation, _, terminated, truncated, _ = env.step(
                         int(rng.integers(2))
                     )
                     if terminated or truncated:
                         break
 
-                # if state is valid
-                if not terminated and not truncated:
+                else:
                     break
 
             # Generate transition state
@@ -106,7 +107,8 @@ def main():
     with args.config.open("rb") as handle:
         config = tomllib.load(handle)
     if args.smoke:
-        config["environment"]["max_steps"] = 30
+        frames, _ = observation_layout(config["environment"])
+        config["environment"]["max_steps"] = max(30, frames)
         config["pretrain"]["transitions"] = 32
     torch.set_num_threads(config["run"]["cpu_threads"])
     validate_ranges(config)

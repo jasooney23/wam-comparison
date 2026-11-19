@@ -3,7 +3,6 @@
 import csv
 import json
 import random
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -11,12 +10,8 @@ import torch
 from tensordict import TensorDict
 from torch.utils.tensorboard import SummaryWriter
 
-# Allow direct execution from the experiment directory.
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
 EXPERIMENT_VERSION = 11
 MODALITIES = ("vector", "combined")
-TENSORBOARD_STATE_NAMES = ("cartPos", "cartVel", "poleAngle")
 
 
 class MetricWriter:
@@ -133,7 +128,7 @@ def next_step_mae(world, data, config, device):
     Returns:
         One mean absolute error per state variable.
     """
-    totals = torch.zeros(3, device=device)
+    totals = torch.zeros(len(world.state_names), device=device)
     count = len(data["vector"])
     for indices in torch.arange(count).split(config["pretrain_eval"]["batch_size"]):
         batch = to_device(data, indices, device, world)
@@ -141,7 +136,7 @@ def next_step_mae(world, data, config, device):
         future = world.predict(latent, batch["action"])
         prediction = world.decode(future)["vector"][:, -1]
         totals += (prediction - batch["next_vector"]).abs().sum(0)
-    return dict(zip(TENSORBOARD_STATE_NAMES, (totals / count).tolist()))
+    return dict(zip(world.state_names, (totals / count).tolist()))
 
 
 @torch.no_grad()
@@ -157,11 +152,11 @@ def reconstruction_mae(world, data, config, device):
     Returns:
         One mean absolute error per state variable.
     """
-    totals = torch.zeros(3, device=device)
+    totals = torch.zeros(len(world.state_names), device=device)
     count = len(data["vector"])
     for indices in torch.arange(count).split(config["pretrain_eval"]["batch_size"]):
         batch = to_device(data, indices, device, world)
         latent = world.encode(batch["vector"], batch.get("image"))
         prediction = world.decode(latent)["vector"][:, -1]
         totals += (prediction - batch["vector"][:, -1]).abs().sum(0)
-    return dict(zip(TENSORBOARD_STATE_NAMES, (totals / count).tolist()))
+    return dict(zip(world.state_names, (totals / count).tolist()))
