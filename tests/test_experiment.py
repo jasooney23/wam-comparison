@@ -381,11 +381,17 @@ def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
     config["pretrain"].update(seeds=[99], epochs=0, world_lr=0)
     settings.validate(config, "train")
     checkpoints = training.load_world_models(config, world_pairs)
+    initial_heads = {}
     for (seed, modality), checkpoint in checkpoints.items():
         directory = training.run_directory(tmp_path / "agents", seed, modality)
         training.run_training(config, seed, modality, checkpoint, directory)
         source, world = checkpoint
         initial = torch.load(directory / "episode-000000.pt", weights_only=False)
+        initial_heads[modality] = {
+            key: value
+            for key, value in initial["agent"].items()
+            if key.startswith(("policy.", "value."))
+        }
         result = torch.load(directory / "episode-000002.pt", weights_only=False)
         for key, value in world["world"].items():
             torch.testing.assert_close(
@@ -427,6 +433,10 @@ def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
         )
         with pytest.raises(FileExistsError):
             training.run_training(config, seed, modality, checkpoint, directory)
+
+    torch.testing.assert_close(
+        initial_heads["vector"], initial_heads["combined"], rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize("missing", ["combined", "later_seed"])

@@ -44,7 +44,7 @@ epochs = 10
 gamma = 0.99
 gae_lambda = 0.95
 clip = 0.2
-max_grad_norm = 1.0
+max_grad_norm = 0.5
 value_weight = 0.5
 entropy_weight = 0.0
 
@@ -55,4 +55,4 @@ batch_size = 64
 [train_eval]
 interval = 100
 eval_episodes = 10
-horizon = 4
+horizon = 1

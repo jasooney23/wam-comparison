@@ -296,7 +296,7 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
     seed_run(seed)
     device = torch.device(config["run"]["device"])
     source, state = checkpoint
-    agent = Agent(modality, config["environment"]).to(device)
+    agent = Agent(modality, config["environment"], head_seed=seed).to(device)
     agent.world.load_state_dict(state["world"])
     agent.world.requires_grad_(False)
     actor, critic, ppo_loss = ppo_modules(agent, config["ppo"])

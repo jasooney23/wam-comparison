@@ -23,6 +23,7 @@ WMs for seed N. Before training any agent, the agent script checks every
 requested pair for matching seed, modality, version, training environment,
 completed epoch, and valid model weights. A missing or incompatible save raises
 an error; intermediate checkpoints are never used as a fallback.
+Each agent seed starts both modalities with identical policy and value weights.
 
 The default stage outputs are `run.output/world-models` and `run.output/agents`.
 Both training scripts accept `--config`, `--smoke`, and `--output`. `--output`
