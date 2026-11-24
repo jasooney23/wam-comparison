@@ -37,9 +37,16 @@ uv run python src/experiments/visual-augmentation-simple/train_agent.py --world-
 
 Agent training needs no dataset. WMs remain frozen, including their saved
 normalization statistics. Agent snapshots record the source WM path and seed.
-There is no resume support. Existing run directories are never overwritten;
-choose a new stage output directory to rerun training. Checkpoints must match
-the experiment version.
+For agent training, repeat your original command with `--resume` to continue
+from the latest saved evaluation for each seed and modality. Completed runs are
+skipped and missing runs start from scratch. You can increase `train.episodes`
+to extend a run. Metrics after the saved checkpoint are discarded and training
+repeats from that point. Older agent checkpoints restore weights and counters
+with a fresh optimizer and random state.
+
+Without `--resume`, agent training requires fresh output directories. World
+model pretraining also requires fresh output directories. Checkpoints must
+match the experiment version.
 
 The generator also refuses to overwrite its dataset. Choose a new
 `pretrain.dataset` path when regenerating; its `--output` overrides the dataset

@@ -18,14 +18,53 @@ class MetricWriter:
     """Write every scalar to CSV and TensorBoard.
 
     Args:
-        directory: New directory for one seed and modality.
+        directory: Run directory for one seed and modality.
+        resume_at: Saved episode and update counts, if resuming an agent run.
     """
 
-    def __init__(self, directory):
-        self.handle = (directory / "metrics.csv").open("x", newline="")
+    def __init__(self, directory, *, resume_at=None):
+        path = directory / "metrics.csv"
+        log_directory = directory / "tensorboard"
+        if resume_at is not None:
+            episodes, updates = resume_at
+            temporary = path.with_suffix(".tmp")
+            old_events = list(log_directory.glob("events.out.tfevents.*"))
+
+            # Keep only metrics covered by the checkpoint.
+            with (
+                path.open(newline="") as source,
+                temporary.open("w", newline="") as target,
+            ):
+                reader = csv.reader(source)
+                writer = csv.writer(target)
+                writer.writerow(next(reader))
+                for row in reader:
+                    if len(row) != 3:
+                        continue
+                    metric, step, value = row
+                    limit = updates if metric.startswith("train/wm/") else episodes
+                    if int(step) <= limit:
+                        writer.writerow((metric, step, value))
+            temporary.replace(path)
+
+            # TensorBoard uses both episode and update steps in this run.
+            self.writer = SummaryWriter(str(log_directory))
+            with path.open(newline="") as source:
+                for row in csv.DictReader(source):
+                    self.writer.add_scalar(
+                        row["metric"], float(row["value"]), int(row["step"])
+                    )
+            self.writer.flush()
+            for event in old_events:
+                event.unlink()
+            self.handle = path.open("a", newline="")
+            self.csv = csv.writer(self.handle)
+            return
+
+        self.handle = path.open("x", newline="")
         self.csv = csv.writer(self.handle)
         self.csv.writerow(("metric", "step", "value"))
-        self.writer = SummaryWriter(str(directory / "tensorboard"))
+        self.writer = SummaryWriter(str(log_directory))
 
     def add_scalar(self, metric, value, step):
         """Record a scalar with the same tag and step in both destinations."""

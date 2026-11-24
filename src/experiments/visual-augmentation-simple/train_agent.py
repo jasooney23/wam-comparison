@@ -281,7 +281,37 @@ def load_world_models(config, source):
     return checkpoints
 
 
-def run_training(config, seed, modality, checkpoint, directory, gui=False):
+def load_agent_checkpoint(directory, config, seed, modality):
+    """Load the latest agent checkpoint and check training settings."""
+    paths = [
+        path
+        for path in directory.glob("episode-*.pt")
+        if path.stem.removeprefix("episode-").isdigit()
+    ]
+    if not paths:
+        raise FileNotFoundError(f"No agent checkpoint in {directory}")
+    path = max(paths, key=lambda path: int(path.stem.removeprefix("episode-")))
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    previous = state["config"]
+    if (
+        state["experiment_version"] != EXPERIMENT_VERSION
+        or state["ppo_backend"] != "torchrl"
+        or state["seed"] != seed
+        or state["modality"] != modality
+        or state["episodes"] != int(path.stem.removeprefix("episode-"))
+        or any(
+            previous[key] != config[key] for key in ("environment", "ppo", "train_eval")
+        )
+        or previous["train"]["policy_lr"] != config["train"]["policy_lr"]
+        or state["episodes"] > config["train"]["episodes"]
+    ):
+        raise ValueError(f"Agent checkpoint is incompatible with this run: {path}")
+    return state
+
+
+def run_training(
+    config, seed, modality, checkpoint, directory, gui=False, *, saved=None
+):
     """Train one agent using an already validated, frozen world model.
 
     Args:
@@ -289,10 +319,12 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
         seed: Agent seed, matching the source WM seed.
         modality: Vector or combined observations.
         checkpoint: Source path and state returned by load_world_models.
-        directory: New output directory for this agent run.
+        directory: Output directory for this agent run.
         gui: Whether to display the training environment.
+        saved: Agent checkpoint to resume, if any.
     """
-    prepare_run(directory, config)
+    if saved is None:
+        prepare_run(directory, config)
     seed_run(seed)
     device = torch.device(config["run"]["device"])
     source, state = checkpoint
@@ -311,11 +343,27 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
         "agent_training_seconds": 0.0,
     }
     episodes, agent_environment_steps = 0, 0
+    if saved is not None:
+        agent.load_state_dict(saved["agent"])
+        source = Path(saved["world_checkpoint"])
+        episodes = saved["episodes"]
+        agent_environment_steps = saved["agent_environment_steps"]
+        counter = saved["counter"]
+        if "policy_optimizer" in saved:
+            policy_optimizer.load_state_dict(saved["policy_optimizer"])
+        else:
+            print(
+                f"{directory}: resuming legacy checkpoint with fresh Adam and RNG",
+                flush=True,
+            )
+
     env = HistoryStackWrapper(
         environment_settings(config), images=agent.world.has_image, gui=gui
     )
-    writer = MetricWriter(directory)
+    writer = None
     try:
+        resume_at = (episodes, counter["agent_updates"]) if saved is not None else None
+        writer = MetricWriter(directory, resume_at=resume_at)
 
         def record():
             """Record OOD evaluation and save an inspectable agent snapshot."""
@@ -336,6 +384,11 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
                     "experiment_version": EXPERIMENT_VERSION,
                     "ppo_backend": "torchrl",
                     "agent": agent.state_dict(),
+                    "policy_optimizer": policy_optimizer.state_dict(),
+                    "torch_rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state(device)
+                    if device.type == "cuda"
+                    else None,
                     "config": config,
                     "seed": seed,
                     "modality": modality,
@@ -352,7 +405,12 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
                 flush=True,
             )
 
-        record()
+        if saved is None:
+            record()
+        elif "torch_rng" in saved:
+            torch.set_rng_state(saved["torch_rng"])
+            if device.type == "cuda" and saved["cuda_rng"] is not None:
+                torch.cuda.set_rng_state(saved["cuda_rng"], device)
         # Train only the policy and value heads.
         while episodes < config["train"]["episodes"]:
             start = perf_counter()
@@ -378,7 +436,8 @@ def run_training(config, seed, modality, checkpoint, directory, gui=False):
             ):
                 record()
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
         env.close()
 
 
@@ -389,6 +448,11 @@ def main():
         "--config", type=Path, default=Path(__file__).with_name("config.toml")
     )
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue from the latest agent checkpoints",
+    )
     parser.add_argument(
         "--output", type=Path, help="Override the agent output directory"
     )
@@ -403,16 +467,30 @@ def main():
     setup_device(config)
     output = args.output or Path(config["run"]["output"]) / "agents"
     source = args.world_models or Path(config["run"]["output"]) / "world-models"
-    check_output(output, config["train"]["seeds"])
+    if not args.resume:
+        check_output(output, config["train"]["seeds"])
     checkpoints = load_world_models(config, source)
+    directories = {key: run_directory(output, *key) for key in checkpoints}
+    saved_runs = {
+        key: load_agent_checkpoint(directory, config, *key)
+        for key, directory in directories.items()
+        if args.resume and directory.exists()
+    }
     for (seed, modality), checkpoint in checkpoints.items():
+        saved = saved_runs.get((seed, modality))
+        if saved is not None and saved["episodes"] == config["train"]["episodes"]:
+            print(
+                f"seed={seed} {modality}: already completed {saved['episodes']} episodes"
+            )
+            continue
         run_training(
             config,
             seed,
             modality,
             checkpoint,
-            run_directory(output, seed, modality),
+            directories[seed, modality],
             args.gui,
+            saved=saved,
         )
 
 

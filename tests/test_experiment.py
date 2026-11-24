@@ -418,10 +418,8 @@ def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
         assert ("mae_cartVel_h0_ood" in metric_rows) == config["environment"][
             "input_cart_vel"
         ]
-        assert (
-            not {"policy_optimizer", "world_optimizer", "torch_rng", "metric_rows"}
-            & result.keys()
-        )
+        assert {"policy_optimizer", "torch_rng"} <= result.keys()
+        assert not {"world_optimizer", "metric_rows"} & result.keys()
         assert [p.name for p in sorted(directory.glob("episode-*.pt"))] == [
             "episode-000000.pt",
             "episode-000001.pt",
@@ -437,6 +435,30 @@ def test_paired_agent_training_needs_no_dataset(config, tmp_path, world_pairs):
     torch.testing.assert_close(
         initial_heads["vector"], initial_heads["combined"], rtol=0, atol=0
     )
+
+
+def test_agent_resume_matches_uninterrupted_training(config, tmp_path, world_pairs):
+    checkpoint = training.load_world_models(config, world_pairs)[0, "vector"]
+    directory = tmp_path / "agents"
+    training.run_training(config, 0, "vector", checkpoint, directory)
+    final_path = directory / "episode-000002.pt"
+    expected = torch.load(final_path, weights_only=True)
+    # Simulate interruption after logging metrics and before saving the checkpoint.
+    final_path.unlink()
+    saved = training.load_agent_checkpoint(directory, config, 0, "vector")
+    assert saved["episodes"] == 1
+    training.run_training(config, 0, "vector", checkpoint, directory, saved=saved)
+    resumed = torch.load(final_path, weights_only=True)
+    torch.testing.assert_close(resumed["agent"], expected["agent"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        resumed["policy_optimizer"], expected["policy_optimizer"]
+    )
+    assert resumed["agent_environment_steps"] == expected["agent_environment_steps"]
+    assert_tensorboard_matches_csv(directory)
+    with (directory / "metrics.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    keys = {(row["metric"], row["step"]) for row in rows}
+    assert len(keys) == len(rows)
 
 
 @pytest.mark.parametrize("missing", ["combined", "later_seed"])
