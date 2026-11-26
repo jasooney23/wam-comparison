@@ -31,7 +31,7 @@ image_weight = 1.0
 
 [train]
 seeds = [0, 1, 2]
-episodes = 10000
+episodes = 5000
 policy_lr = 0.0003
 # Shared in-distribution ranges for dataset generation and agent training.
 cart_mass = [0.5, 1]
