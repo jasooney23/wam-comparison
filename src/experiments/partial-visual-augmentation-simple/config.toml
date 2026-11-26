@@ -1,0 +1,48 @@
+[run]
+output = "outputs/partial-visual-augmentation-simple"
+device = "cuda"
+cpu_threads = 1
+
+[environment]
+history_frames = 1
+input_cart_pos = true
+input_cart_vel = false
+input_pole_angle = true
+input_pole_vel = false
+
+[pretrain]
+seeds = [0, 1, 2]
+max_grad_norm = 1.0
+dataset = "outputs/partial-visual-augmentation-simple/dataset.pt"
+transitions = 10000
+epochs = 100
+eval_every = 5
+batch_size = 64
+world_lr = 0.0003
+vector_weight = 1.0
+image_weight = 1.0
+
+[train]
+seeds = [0, 1, 2]
+episodes = 2000
+policy_lr = 0.0003
+
+[ppo]
+rollout_steps = 2048
+minibatch_size = 64
+epochs = 10
+gamma = 0.99
+gae_lambda = 0.95
+clip = 0.2
+max_grad_norm = 0.5
+value_weight = 0.5
+entropy_weight = 0.0
+
+[pretrain_eval]
+transitions = 500
+batch_size = 64
+
+[train_eval]
+interval = 100
+eval_episodes = 10
+horizon = 1
