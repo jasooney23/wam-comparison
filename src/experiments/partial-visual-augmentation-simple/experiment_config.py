@@ -12,8 +12,16 @@ import gymnasium as gym
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from src.common.environments.cartpole.observations import observation_layout
+from src.common.models.world_model import WorldModel
 
 ENV_ID = "CartPole-v1"
+
+
+def build_world_model(modality, settings):
+    """Build a world model with about 28,600 parameters for either modality."""
+    if modality == "vector":
+        return WorldModel(modality, settings, hidden_width=388)
+    return WorldModel(modality, settings, image_channels=8)
 
 
 def environment_settings(config):

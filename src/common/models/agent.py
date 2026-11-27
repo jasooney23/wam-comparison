@@ -14,11 +14,14 @@ class Agent(nn.Module):
         modality: World-model observation modality.
         settings: Optional CartPole observation settings.
         head_seed: Optional PyTorch seed for initializing both heads.
+        world: Optional world model to use in place of the default model.
     """
 
-    def __init__(self, modality: str, settings=None, *, head_seed: int | None = None):
+    def __init__(
+        self, modality: str, settings=None, *, head_seed: int | None = None, world=None
+    ):
         super().__init__()
-        self.world = WorldModel(modality, settings)
+        self.world = WorldModel(modality, settings) if world is None else world
 
         # Match head weights across world-model modalities.
         if head_seed is not None:

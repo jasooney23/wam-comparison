@@ -17,9 +17,13 @@ class WorldModel(nn.Module):
     Args:
         modality: Vector or combined.
         settings: Optional CartPole observation settings.
+        hidden_width: Hidden width for vector encoding, decoding, and dynamics.
+        image_channels: First image encoder layer's channel count.
     """
 
-    def __init__(self, modality: str, settings=None):
+    def __init__(
+        self, modality: str, settings=None, *, hidden_width=32, image_channels=16
+    ):
         super().__init__()
         if modality not in {"vector", "combined"}:
             raise ValueError(f"Unknown modality: {modality}")
@@ -29,19 +33,21 @@ class WorldModel(nn.Module):
         self.state_names = tuple(state_names[index] for index in indices)
         vector_size = len(indices)
         history_size = frames * vector_size
-        self.vector_encoder = MLP(history_size, 16, [32])
+        self.vector_encoder = MLP(history_size, 16, [hidden_width])
         self.vector_decoder = nn.Sequential(
-            MLP(16, history_size, [32]), nn.Unflatten(1, (frames, vector_size))
+            MLP(16, history_size, [hidden_width]),
+            nn.Unflatten(1, (frames, vector_size)),
         )
         if self.has_image:
             # Three stride-two layers reduce each image side by a factor of eight.
             feature_side = IMAGE_SIZE // 8
-            feature_count = 32 * feature_side**2
+            feature_channels = 2 * image_channels
+            feature_count = feature_channels * feature_side**2
             self.image_encoder = nn.Sequential(
                 *CNN(
                     frames,
-                    32,
-                    [16, 32],
+                    feature_channels,
+                    [image_channels, feature_channels],
                     kernel_size=4,
                     stride=2,
                     padding=1,
@@ -52,11 +58,11 @@ class WorldModel(nn.Module):
             )
             self.image_decoder = nn.Sequential(
                 MLP(16, feature_count, [32]),
-                nn.Unflatten(1, (32, feature_side, feature_side)),
+                nn.Unflatten(1, (feature_channels, feature_side, feature_side)),
                 *TransposeCNN(
-                    32,
+                    feature_channels,
                     frames,
-                    [32, 16],
+                    [feature_channels, image_channels],
                     kernel_size=4,
                     stride=2,
                     padding=1,
@@ -64,7 +70,7 @@ class WorldModel(nn.Module):
                 ),
             )
         self.projection = nn.Linear(16 * (1 + self.has_image), 16)
-        self.dynamics = MLP(16 + 2, 16, [32])  # z = 16, cartpole act = 2
+        self.dynamics = MLP(16 + 2, 16, [hidden_width])  # z = 16, cartpole act = 2
         self.register_buffer("mean", torch.zeros(vector_size))
         self.register_buffer("std", torch.ones(vector_size))
 

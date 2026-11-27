@@ -5,7 +5,7 @@ from pathlib import Path
 from time import perf_counter
 
 import torch
-from experiment_config import environment_settings, load_config
+from experiment_config import build_world_model, environment_settings, load_config
 from training_utils import (
     EXPERIMENT_VERSION,
     MODALITIES,
@@ -23,7 +23,6 @@ from training_utils import (
 )
 
 from src.common.environments.cartpole.observations import IMAGE_SIZE
-from src.common.models.world_model import WorldModel
 
 
 def load_dataset(config):
@@ -64,7 +63,7 @@ def run_pretraining(config, seed, modality, payload, directory):
     prepare_run(directory, config)
     seed_run(seed)
     device = torch.device(config["run"]["device"])
-    world = WorldModel(modality, config["environment"]).to(device)
+    world = build_world_model(modality, config["environment"]).to(device)
     settings = config["pretrain"]
     data = payload["training"]
     optimizer = torch.optim.Adam(world.parameters(), lr=settings["world_lr"])

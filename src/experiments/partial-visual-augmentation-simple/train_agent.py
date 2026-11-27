@@ -7,7 +7,7 @@ from time import perf_counter
 import numpy as np
 import torch
 from cartpole_observation import CartPoleObservation
-from experiment_config import environment_settings, load_config
+from experiment_config import build_world_model, environment_settings, load_config
 from tensordict import TensorDict
 from tensordict.nn import TensorDictModule
 from torchrl.envs.utils import ExplorationType, set_exploration_type
@@ -30,7 +30,6 @@ from training_utils import (
 )
 
 from src.common.models.agent import Agent
-from src.common.models.world_model import WorldModel
 
 
 def ppo_modules(agent, settings):
@@ -261,7 +260,7 @@ def load_world_models(config, source):
                     f"World checkpoint is incomplete or incompatible: {path}"
                 )
             try:
-                world = WorldModel(modality, settings)
+                world = build_world_model(modality, settings)
                 world.load_state_dict(state["world"])
                 if any(
                     not torch.isfinite(value).all()
@@ -326,7 +325,8 @@ def run_training(
     seed_run(seed)
     device = torch.device(config["run"]["device"])
     source, state = checkpoint
-    agent = Agent(modality, config["environment"], head_seed=seed).to(device)
+    world = build_world_model(modality, config["environment"])
+    agent = Agent(modality, head_seed=seed, world=world).to(device)
     agent.world.load_state_dict(state["world"])
     agent.world.requires_grad_(False)
     actor, critic, ppo_loss = ppo_modules(agent, config["ppo"])

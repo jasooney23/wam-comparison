@@ -10,7 +10,7 @@ import torch
 from tensordict import TensorDict
 from torch.utils.tensorboard import SummaryWriter
 
-EXPERIMENT_VERSION = 12
+EXPERIMENT_VERSION = 13
 MODALITIES = ("vector", "combined")
 
 
